@@ -1,24 +1,29 @@
-# Configuration for MobileCLIP2‑S4 fine‑tuning with dual distillation
+# MobileCLIP2-S4 — LPCV 2026 Image-Text Retrieval (dual-teacher distillation)
+# Dataset: https://lpcv.ai/2026LPCVC/image-text-retrieval/
+# Expected layout: DATASET.md in project root
 
 data:
+  dataset_type: json                   # "json" | "coco" | "csv"
   image_root: ./data/images
   captions_json: ./data/captions.json
+  filter_missing: true                 # true: 이미지 존재하는 쌍만 사용 (캡션/이미지 수 불일치 대응)
+  # csv_path: dataset/data2/dataset_zip/lpcvc_300k_master_fixed.csv  # dataset_type: csv, image_root: dataset/data2/dataset_zip
   val_split: 0.05
 
 model:
-  student_name: mobileclip2_s4        # open‑clip identifier for MobileCLIP2‑S4
-  teacher_names: [siglip2_so400m_14, dfn_vit_l_14]  # list of teacher models (placeholders)
+  student_name: mobileclip2_s4         # open_clip MobileCLIP2-S4 (~50M params)
+  teacher_names: [siglip2_so400m_14, dfn_vit_l_14]  # two teachers for dual distillation
   embed_dim: 512
-  temperature: 0.04
+  temperature: 0.04                   # often lower for smaller models
 
 training:
-  batch_size: 256
+  batch_size: 256                      # MobileCLIP2-S4 is lighter; can use larger batch
   epochs: 12
   lr: 5.0e-4
   weight_decay: 0.2
   warmup: 1000
   use_teacher: true
-  distill_weights: [0.4, 0.4]         # weights for each teacher loss
+  distill_weights: [0.4, 0.4]         # one weight per teacher (must match teacher_names length)
   clip_grad_norm: 1.0
   amp: true
   ema_decay: 0.9995

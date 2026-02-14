@@ -11,7 +11,7 @@ This project fine‑tunes the **EVA‑02‑CLIP‑L** (428 M parameters) visio
 
 ## Training procedure
 
-1. **Dataset preparation** – organise image files and captions in the same way as the other projects.  Large models benefit from more data; consider using MS‑COCO plus additional web‑scraped pairs if allowed by competition rules.
+1. **Dataset preparation** – use the [LPCV 2026 Image-Text Retrieval](https://lpcv.ai/2026LPCVC/image-text-retrieval/) dataset; see [DATASET.md](../DATASET.md) for the expected layout.  Organise image files and captions as in the other projects.  Large models benefit from more data; consider MS‑COCO or additional pairs if allowed by competition rules.
 2. **Load models** – `train.py` loads the EVA‑02‑CLIP‑L student with `open_clip` and the chosen teacher model.  Because the student is large, consider using gradient accumulation or reducing batch size to fit on GPU memory.
 3. **Losses** – training follows the standard CLIP contrastive loss plus optional distillation loss from the teacher.  EVA‑CLIP uses the same cross‑entropy loss as OpenAI‑CLIP.
 4. **Optimisation** – due to the model’s size, learning rate and weight decay must be tuned carefully.  The default configuration uses a smaller batch size and learning rate.

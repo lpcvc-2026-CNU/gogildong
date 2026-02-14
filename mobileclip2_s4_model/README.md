@@ -20,9 +20,7 @@ state‑of‑the‑art zero‑shot accuracy in a 50 MB package【69146841618205
 
 ## Training procedure
 
-1. **Dataset** – prepare a retrieval dataset such as MS‑COCO or the
-   competition dataset.  Align images and captions in a JSON file and
-   set `image_root` and `captions_json` in `config.yaml`.
+1. **Dataset** – use the [LPCV 2026 Image-Text Retrieval](https://lpcv.ai/2026LPCVC/image-text-retrieval/) dataset or e.g. MS‑COCO.  See [DATASET.md](../DATASET.md) for the expected layout.  Align images and captions in a JSON file and set `image_root` and `captions_json` in `config.yaml`.
 2. **Load student** – `train.py` uses [open‑clip](https://github.com/mlfoundations/open_clip)
    to load the `mobileclip2_s4` student.  The model’s vision encoder is
    a hybrid convolution–transformer architecture optimised for mobile.

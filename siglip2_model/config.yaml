@@ -1,28 +1,34 @@
-# Configuration for SigLIP 2 Base fine‑tuning
+# SigLIP 2 Base — LPCV 2026 Image-Text Retrieval
+# Dataset: https://lpcv.ai/2026LPCVC/image-text-retrieval/
+# Expected layout: DATASET.md in project root
 
 data:
-  image_root: ./data/images            # path to directory containing training images
-  captions_json: ./data/captions.json  # JSON file with [{"image": "img.jpg", "caption": "..."}, ...]
-  val_split: 0.05                      # fraction of data reserved for validation
+  dataset_type: json                   # "json" | "coco" | "csv"
+  image_root: ./data/images            # directory containing training images (JPEG/PNG)
+  captions_json: ./data/captions.json  # for json: [{"image": "file.jpg", "caption": "..."}, ...]
+  filter_missing: true                # true: 이미지 파일이 있는 쌍만 사용 (캡션/이미지 수 불일치 대응)
+  # MS COCO: dataset_type: coco, image_root: dataset/train2017, coco_annotations: dataset/annotations/captions_train2017.json
+  # data2 CSV: dataset_type: csv, image_root: dataset/data2/dataset_zip, csv_path: dataset/data2/dataset_zip/lpcvc_300k_master_fixed.csv
+  val_split: 0.05                      # fraction of data for validation (e.g. 5%)
 
 model:
-  student_name: siglip2_base           # open‑clip model identifier for the student
-  teacher_name: siglip2_so400m         # set to null to disable distillation
-  embed_dim: 512                       # embedding dimension (SigLIP base uses 512)
-  temperature: 0.07                    # temperature parameter for contrastive loss
+  student_name: siglip2_base           # open_clip student (SigLIP 2 Base, ~86M params)
+  teacher_name: siglip2_so400m         # teacher for distillation; set null to disable
+  embed_dim: 512                       # embedding dimension (SigLIP base = 512)
+  temperature: 0.07                    # contrastive loss temperature (typical 0.02–0.07)
 
 training:
-  batch_size: 128
+  batch_size: 128                      # per-device batch size; reduce if OOM
   epochs: 10
-  lr: 5.0e-4
+  lr: 5.0e-4                           # peak learning rate
   weight_decay: 0.2
-  warmup: 1000                         # number of warmup steps
+  warmup: 1000                         # warmup steps (before cosine decay)
   use_teacher: true                    # enable knowledge distillation
-  distill_weight: 0.5                  # weight of the distillation loss
-  clip_grad_norm: 1.0                  # gradient clipping threshold
-  amp: true                            # use automatic mixed precision
-  ema_decay: 0.9995                    # exponential moving average decay for student weights
+  distill_weight: 0.5                  # weight of distillation loss vs contrastive
+  clip_grad_norm: 1.0                  # gradient clipping max norm
+  amp: true                            # automatic mixed precision (FP16)
+  ema_decay: 0.9995                    # EMA decay for student (optional)
 
 paths:
-  save_dir: runs/siglip2               # where to save checkpoints and logs
-  onnx_dir: exported_onnx              # directory for ONNX exports
+  save_dir: runs/siglip2               # checkpoints and logs
+  onnx_dir: exported_onnx              # ONNX export output directory

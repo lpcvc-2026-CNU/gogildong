@@ -1,20 +1,25 @@
-# Configuration for EVA‑02‑CLIP‑L fine‑tuning
+# EVA-02-CLIP-L — LPCV 2026 Image-Text Retrieval
+# Dataset: https://lpcv.ai/2026LPCVC/image-text-retrieval/
+# Expected layout: DATASET.md in project root
 
 data:
+  dataset_type: json                   # "json" | "coco" | "csv"
   image_root: ./data/images
   captions_json: ./data/captions.json
+  filter_missing: true                 # true: 이미지 존재하는 쌍만 사용 (캡션/이미지 수 불일치 대응)
+  # csv_path: dataset/data2/dataset_zip/lpcvc_300k_master_fixed.csv  # dataset_type: csv, image_root: dataset/data2/dataset_zip
   val_split: 0.05
 
 model:
-  student_name: eva02_clip_l_14        # open‑clip identifier for EVA‑02‑CLIP‑L
-  teacher_name: eva02_clip_e_14        # teacher model name (set to null to disable distillation)
-  embed_dim: 768
-  temperature: 0.02
+  student_name: eva02_clip_l_14       # open_clip EVA-02-CLIP-L/14 (~428M params)
+  teacher_name: eva02_clip_e_14       # optional larger teacher; set null to disable
+  embed_dim: 768                      # EVA-L embedding dimension
+  temperature: 0.02                   # lower temperature common for larger CLIPs
 
 training:
-  batch_size: 64                      # reduce batch size due to model size
+  batch_size: 64                      # smaller batch due to model size (reduce if OOM)
   epochs: 8
-  lr: 2.0e-4
+  lr: 2.0e-4                          # lower lr for larger model
   weight_decay: 0.1
   warmup: 500
   use_teacher: true

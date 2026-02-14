@@ -1,4 +1,4 @@
-"""Compile and profile MobileCLIP2 ONNX encoders on Qualcomm AI Hub.
+"""Compile and profile MobileCLIP2 ONNX encoders on Qualcomm AI Hub.
 
 Identical to the SigLIP variant but placed here for convenience.
 """

@@ -9,7 +9,7 @@ This project implements an **image–text retrieval model** based on **SigLIP 2
 
 ## Training procedure
 
-1. **Dataset preparation** – download and organise the image–text pairs from the LPCVC dataset.  The default script expects two folders: `images/` containing JPEG/PNG files and `captions.json` containing a list of captions aligned with image names.  Update the paths in `config.yaml` accordingly.
+1. **Dataset preparation** – download and organise the image–text pairs from the [LPCV 2026 Image-Text Retrieval](https://lpcv.ai/2026LPCVC/image-text-retrieval/) dataset.  See the project root’s [DATASET.md](../DATASET.md) for the expected layout.  The default script expects `images/` and `captions.json`; update `image_root` and `captions_json` in `config.yaml` accordingly.
 2. **Load models** – `train.py` uses [open‑clip](https://github.com/mlfoundations/open_clip) to load the SigLIP 2 Base model and, if `use_teacher=true`, a larger SigLIP 2 model for distillation.  Both models are loaded in evaluation mode on a single GPU.
 3. **Losses** – the student is optimised with a combination of:
    * **Contrastive loss** – cross‑entropy between cosine similarities of image/text embeddings and a diagonal target matrix (InfoNCE/NT‑Xent).

@@ -11,15 +11,18 @@ augmentation, distributed training and other techniques as needed.
 """
 
 import argparse
-import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from dataset_loader import ImageTextDataset, build_annotations
+
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
 
@@ -28,8 +31,12 @@ import open_clip
 
 @dataclass
 class Config:
+    dataset_type: str
     image_root: str
-    captions_json: str
+    captions_json: Optional[str]
+    coco_annotations: Optional[str]
+    csv_path: Optional[str]
+    filter_missing: bool
     val_split: float
     student_name: str
     teacher_names: List[str]
@@ -58,8 +65,12 @@ class Config:
         train = cfg['training']
         paths = cfg['paths']
         return Config(
+            dataset_type=str(data.get('dataset_type', 'json')),
             image_root=data['image_root'],
-            captions_json=data['captions_json'],
+            captions_json=data.get('captions_json'),
+            coco_annotations=data.get('coco_annotations'),
+            csv_path=data.get('csv_path'),
+            filter_missing=bool(data.get('filter_missing', True)),
             val_split=float(data.get('val_split', 0.05)),
             student_name=model['student_name'],
             teacher_names=model.get('teacher_names', []),
@@ -78,26 +89,6 @@ class Config:
             save_dir=paths['save_dir'],
             onnx_dir=paths['onnx_dir'],
         )
-
-
-class ImageTextDataset(Dataset):
-    def __init__(self, image_root: str, json_path: str, transform: transforms.Compose, tokenizer):
-        self.image_root = Path(image_root)
-        with open(json_path, 'r', encoding='utf-8') as f:
-            self.annotations = json.load(f)
-        self.transform = transform
-        self.tokenizer = tokenizer
-
-    def __len__(self) -> int:
-        return len(self.annotations)
-
-    def __getitem__(self, idx: int):
-        item = self.annotations[idx]
-        image_path = self.image_root / item['image']
-        caption = item['caption']
-        image = self.transform(Image.open(image_path).convert('RGB'))
-        text_inputs = self.tokenizer([caption])
-        return image, text_inputs
 
 
 def contrastive_loss(image_feats: torch.Tensor, text_feats: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -134,8 +125,16 @@ def main(config: Config):
             teacher_models.append(model)
         assert len(config.distill_weights) == len(teacher_models), "Number of distill_weights must match teacher_names"
 
-    # Dataset
-    dataset = ImageTextDataset(config.image_root, config.captions_json, preprocess, tokenizer)
+    # Dataset (json / coco / csv). filter_missing=True 시 존재하는 이미지 쌍만 사용.
+    annotations = build_annotations(
+        config.dataset_type,
+        config.image_root,
+        captions_json=config.captions_json,
+        coco_annotations=config.coco_annotations,
+        csv_path=config.csv_path,
+        filter_missing=config.filter_missing,
+    )
+    dataset = ImageTextDataset(config.image_root, annotations, preprocess, tokenizer)
     val_size = int(len(dataset) * config.val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])

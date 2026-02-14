@@ -2,6 +2,9 @@
 
 This directory contains three example implementations for the **LPCVC 2026 Track 1 Image‑to‑Text Retrieval** task.  Each subdirectory holds a self‑contained project that follows the conventions of the official sample solution (export, compile/profile, upload, inference) but swaps the encoders for more advanced vision‑language models described in the research summary.
 
+- **Track & dataset:** [LPCV 2026 Image-Text Retrieval](https://lpcv.ai/2026LPCVC/image-text-retrieval/)
+- **Dataset preparation and expected layout:** see [DATASET.md](DATASET.md).
+
 The projects are intended as starting points.  You should review the included `README.md` files and adjust hyper‑parameters, data paths, and training settings according to your needs and the LPCVC competition rules.
 
 ## Projects
@@ -21,4 +24,4 @@ Each subproject contains:
 * **`compile_and_profile.py`** — wrapper script that submits ONNX models to Qualcomm AI Hub for compilation and profiling.  You may need to install `qai_hub` and configure your token.
 * **`inference.py`** — runs the compiled models on a dataset and computes retrieval metrics such as Recall@10.
 
-These templates do **not** download or preprocess data.  You must provide a dataset (e.g., MS‑COCO or the competition dataset) and ensure that the `data_root` paths in `config.yaml` are correct.
+These templates do **not** download or preprocess data.  You must provide a dataset (e.g., MS‑COCO or the competition dataset) and ensure that the `image_root` and `captions_json` paths in each model’s `config.yaml` are correct.  See [DATASET.md](DATASET.md) for the expected data layout and official track/dataset links.
