@@ -1,0 +1,28 @@
+# Configuration for EVA‑02‑CLIP‑L fine‑tuning
+
+data:
+  image_root: ./data/images
+  captions_json: ./data/captions.json
+  val_split: 0.05
+
+model:
+  student_name: eva02_clip_l_14        # open‑clip identifier for EVA‑02‑CLIP‑L
+  teacher_name: eva02_clip_e_14        # teacher model name (set to null to disable distillation)
+  embed_dim: 768
+  temperature: 0.02
+
+training:
+  batch_size: 64                      # reduce batch size due to model size
+  epochs: 8
+  lr: 2.0e-4
+  weight_decay: 0.1
+  warmup: 500
+  use_teacher: true
+  distill_weight: 0.5
+  clip_grad_norm: 1.0
+  amp: true
+  ema_decay: 0.999
+
+paths:
+  save_dir: runs/eva_clip_l
+  onnx_dir: exported_onnx

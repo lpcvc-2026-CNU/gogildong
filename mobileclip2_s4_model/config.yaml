@@ -1,0 +1,28 @@
+# Configuration for MobileCLIP2‑S4 fine‑tuning with dual distillation
+
+data:
+  image_root: ./data/images
+  captions_json: ./data/captions.json
+  val_split: 0.05
+
+model:
+  student_name: mobileclip2_s4        # open‑clip identifier for MobileCLIP2‑S4
+  teacher_names: [siglip2_so400m_14, dfn_vit_l_14]  # list of teacher models (placeholders)
+  embed_dim: 512
+  temperature: 0.04
+
+training:
+  batch_size: 256
+  epochs: 12
+  lr: 5.0e-4
+  weight_decay: 0.2
+  warmup: 1000
+  use_teacher: true
+  distill_weights: [0.4, 0.4]         # weights for each teacher loss
+  clip_grad_norm: 1.0
+  amp: true
+  ema_decay: 0.9995
+
+paths:
+  save_dir: runs/mobileclip2_s4
+  onnx_dir: exported_onnx
