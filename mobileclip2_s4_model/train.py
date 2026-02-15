@@ -123,6 +123,48 @@ def distillation_loss(student_feats: torch.Tensor, teacher_feats: torch.Tensor) 
     return F.mse_loss(student_feats, teacher_feats)
 
 
+def _tokenize_texts(tokenizer, captions, device: torch.device, context_length: Optional[int] = None) -> torch.Tensor:
+    """Tokenize captions with fallback for HF tokenizers lacking `batch_encode_plus`."""
+    texts = [captions] if isinstance(captions, str) else list(captions)
+    try:
+        if context_length is not None:
+            try:
+                token_ids = tokenizer(texts, context_length=context_length)
+            except TypeError:
+                token_ids = tokenizer(texts)
+        else:
+            token_ids = tokenizer(texts)
+    except AttributeError as err:
+        if 'batch_encode_plus' not in str(err):
+            raise
+        hf_tokenizer = getattr(tokenizer, 'tokenizer', None)
+        if hf_tokenizer is None:
+            raise
+
+        clean_fn = getattr(tokenizer, 'clean_fn', None)
+        if callable(clean_fn):
+            texts = [clean_fn(t) for t in texts]
+
+        max_len = context_length or getattr(tokenizer, 'context_length', None) or 77
+        encoded = hf_tokenizer(
+            texts,
+            return_tensors='pt',
+            max_length=max_len,
+            padding='max_length',
+            truncation=True,
+        )
+        token_ids = encoded['input_ids'] if isinstance(encoded, dict) else encoded.input_ids
+
+        if getattr(tokenizer, 'strip_sep_token', False):
+            sep_token_id = getattr(hf_tokenizer, 'sep_token_id', None)
+            if sep_token_id is not None:
+                token_ids = torch.where(token_ids == sep_token_id, torch.zeros_like(token_ids), token_ids)
+
+    if token_ids.dim() == 3:
+        token_ids = token_ids.squeeze(1)
+    return token_ids.to(device)
+
+
 def _model_features(model, images: torch.Tensor, texts) -> tuple:
     """Return (image_features, text_features) from model; handles dict or tuple output (open_clip)."""
     out = model(images, texts)
@@ -206,9 +248,7 @@ def main(config: Config):
                 optimiser.zero_grad()
             images = images.to(device)
             # 원문 캡션 → 각 모델의 tokenizer로 토큰화 (context_length 64/77 등 호환)
-            texts_student = tokenizer(captions).to(device)
-            if texts_student.dim() == 3:
-                texts_student = texts_student.squeeze(1)
+            texts_student = _tokenize_texts(tokenizer, captions, device, context_length=getattr(student_model, 'context_length', None))
             with torch.amp.autocast('cuda', enabled=config.amp):
                 img_embeds, txt_embeds = _model_features(student_model, images, texts_student)
                 loss = contrastive_loss(img_embeds, txt_embeds, config.temperature)
@@ -216,9 +256,7 @@ def main(config: Config):
                     for weight, teacher, tok in zip(config.distill_weights, teacher_models, teacher_tokenizers):
                         # Teacher마다 text context length가 다를 수 있어
                         # 해당 teacher의 tokenizer를 사용해야 길이(예: 64/77) 불일치가 나지 않는다.
-                        texts_t = tok(captions).to(device)
-                        if texts_t.dim() == 3:
-                            texts_t = texts_t.squeeze(1)
+                        texts_t = _tokenize_texts(tok, captions, device, context_length=getattr(teacher, 'context_length', None))
                         with torch.no_grad():
                             t_img, t_txt = _model_features(teacher, images, texts_t)
                         loss += weight * (distillation_loss(img_embeds, t_img) + distillation_loss(txt_embeds, t_txt))
@@ -249,9 +287,7 @@ def evaluate(model, loader: DataLoader, device: torch.device, temperature: float
     with torch.no_grad():
         for images, captions in loader:
             images = images.to(device)
-            texts = tokenizer(captions).to(device)
-            if texts.dim() == 3:
-                texts = texts.squeeze(1)
+            texts = _tokenize_texts(tokenizer, captions, device, context_length=getattr(model, 'context_length', None))
             img_feats, txt_feats = _model_features(model, images, texts)
             img_feats = F.normalize(img_feats, dim=-1)
             txt_feats = F.normalize(txt_feats, dim=-1)
