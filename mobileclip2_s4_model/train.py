@@ -1,4 +1,4 @@
-"""Train a MobileCLIP 2 S4 model with optional dual‑teacher distillation.
+"""Train a MobileCLIP 2 S4 model with optional dual‑teacher distillation.
 
 This script extends the SigLIP training example to support multiple
 teachers.  It loads a MobileCLIP2‑S4 student from `open_clip`, loads
@@ -14,6 +14,7 @@ import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -68,6 +69,7 @@ class Config:
     accumulation_steps: int
     save_dir: str
     onnx_dir: str
+    log_interval: int = 10  # Log every N batches
 
     @staticmethod
     def from_yaml(path: str) -> 'Config':
@@ -104,6 +106,7 @@ class Config:
             accumulation_steps=int(train.get('accumulation_steps', 1)),
             save_dir=paths['save_dir'],
             onnx_dir=paths['onnx_dir'],
+            log_interval=int(train.get('log_interval', 10)),
         )
 
 
@@ -173,6 +176,27 @@ def _model_features(model, images: torch.Tensor, texts) -> tuple:
     return out[0], out[1]
 
 
+def format_time(seconds: float) -> str:
+    """Format seconds into human-readable time string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        mins = seconds / 60
+        return f"{mins:.1f}m"
+    else:
+        hours = seconds / 3600
+        return f"{hours:.1f}h"
+
+
+def get_gpu_memory() -> str:
+    """Get current GPU memory usage in MB."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        return f"{allocated:.0f}/{reserved:.0f}MB"
+    return "N/A"
+
+
 def main(config: Config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Resolve paths relative to project root (works whether run from root or model subdir)
@@ -183,21 +207,42 @@ def main(config: Config):
     save_dir = _resolve_path(config.save_dir)
     os.makedirs(save_dir, exist_ok=True)
     torch.cuda.empty_cache()
+    
+    print("=" * 80)
+    print("TRAINING CONFIGURATION")
+    print("=" * 80)
+    print(f"Device: {device}")
+    print(f"Student Model: {config.student_name}")
+    print(f"Teachers: {config.teacher_names if config.use_teacher else 'None'}")
+    print(f"Batch Size: {config.batch_size}")
+    print(f"Accumulation Steps: {config.accumulation_steps}")
+    print(f"Effective Batch Size: {config.batch_size * config.accumulation_steps}")
+    print(f"Epochs: {config.epochs}")
+    print(f"Learning Rate: {config.lr}")
+    print(f"AMP Enabled: {config.amp}")
+    print(f"Save Directory: {save_dir}")
+    print("=" * 80)
+    print()
+    
     # Load student
     # 224로 통일해 teacher(ViT 224)와 호환 (student 기본 256이면 충돌 방지)
+    print("Loading student model...")
     student_model, _, preprocess = open_clip.create_model_and_transforms(
         config.student_name, pretrained='dfndr2b', precision='fp32', force_image_size=224
     )
     tokenizer = open_clip.get_tokenizer(config.student_name)
     student_model.to(device)
     student_model.train()
+    print(f"✓ Student model loaded: {config.student_name}")
+    
     # Load teachers + 각 teacher용 tokenizer (context_length 64/77 등 호환)
     teacher_models = []
     teacher_tokenizers = []
     if config.use_teacher:
+        print("\nLoading teacher models...")
         for i, name in enumerate(config.teacher_names):
             tag = config.pretrained_tags[i]
-            print(f"Loading Teacher {i+1}: {name} ({tag})...")
+            print(f"  [{i+1}/{len(config.teacher_names)}] Loading {name} ({tag})...")
             kwargs = {
                 'model_name': name,
                 'pretrained': tag,
@@ -205,7 +250,7 @@ def main(config: Config):
                 'force_image_size': 224,
             }
             if 'ViT-L-14' in name and tag == 'dfn2b':
-                print(f"--> Applying force_quick_gelu=True for {name}")
+                print(f"      --> Applying force_quick_gelu=True for {name}")
                 kwargs['force_quick_gelu'] = True
             model, _, _ = open_clip.create_model_and_transforms(**kwargs)
             model.to(device)
@@ -214,7 +259,9 @@ def main(config: Config):
                 param.requires_grad = False
             teacher_models.append(model)
             teacher_tokenizers.append(open_clip.get_tokenizer(name))
+            print(f"      ✓ Teacher {i+1} loaded")
         assert len(config.distill_weights) == len(teacher_models), "Number of distill_weights must match teacher_names"
+        print(f"✓ All {len(teacher_models)} teacher models loaded")
     torch.cuda.empty_cache()
 
     # Teacher 1 (SigLIP2: 1152)용 프로젝션
@@ -224,6 +271,7 @@ def main(config: Config):
     proj_t2 = torch.nn.Linear(768, 768).to(device)
 
     # Dataset (json / coco / csv). filter_missing=True 시 존재하는 이미지 쌍만 사용.
+    print("\nLoading dataset...")
     annotations = build_annotations(
         config.dataset_type,
         image_root,
@@ -238,6 +286,10 @@ def main(config: Config):
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    print(f"✓ Dataset loaded: {len(dataset)} total samples")
+    print(f"  Train: {train_size} samples ({len(train_loader)} batches)")
+    print(f"  Val: {val_size} samples ({len(val_loader)} batches)")
+    
     # Optimiser
     params = list(student_model.parameters()) + list(proj_t1.parameters()) + list(proj_t2.parameters())
     optimiser = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
@@ -246,13 +298,29 @@ def main(config: Config):
     total_steps = config.epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=total_steps)
     scaler = torch.amp.GradScaler('cuda', enabled=config.amp)
+    
+    print(f"\nOptimizer steps per epoch: {steps_per_epoch}")
+    print(f"Total optimizer steps: {total_steps}")
+    print()
+    print("=" * 80)
+    print("STARTING TRAINING")
+    print("=" * 80)
+    print()
+    
     best_r10 = 0.0
+    
     for epoch in range(1, config.epochs + 1):
         student_model.train()
         epoch_loss = 0.0
+        epoch_start_time = time.time()
+        batch_times = []
+
+        # 에포크 시작 시 한 번 초기화
+        optimiser.zero_grad()
+
         for batch_idx, (images, captions) in enumerate(train_loader):
-            if batch_idx % accum == 0:
-                optimiser.zero_grad()
+            batch_start_time = time.time()
+            
             images = images.to(device)
             # 원문 캡션 → 각 모델의 tokenizer로 토큰화 (context_length 64/77 등 호환)
             texts_student = _tokenize_texts(tokenizer, captions, device, context_length=getattr(student_model, 'context_length', None))
@@ -287,23 +355,86 @@ def main(config: Config):
                 # Gradient Accumulation 적용
                 loss = loss / accum
             scaler.scale(loss).backward()
+
             if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == len(train_loader):
                 if config.clip_grad_norm > 0:
                     scaler.unscale_(optimiser)
-                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), config.clip_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(params, config.clip_grad_norm)
                 scaler.step(optimiser)
                 scaler.update()
                 scheduler.step()
+                optimiser.zero_grad()
+                
             epoch_loss += loss.item() * accum
+            
+            # Batch timing
+            batch_time = time.time() - batch_start_time
+            batch_times.append(batch_time)
+            
+            # Batch-level logging
+            if (batch_idx + 1) % config.log_interval == 0 or (batch_idx + 1) == len(train_loader):
+                avg_batch_time = sum(batch_times[-config.log_interval:]) / len(batch_times[-config.log_interval:])
+                batches_remaining = len(train_loader) - (batch_idx + 1)
+                eta = avg_batch_time * batches_remaining
+                current_lr = optimiser.param_groups[0]['lr']
+                progress = (batch_idx + 1) / len(train_loader) * 100
+                gpu_mem = get_gpu_memory()
+                
+                print(f"Epoch [{epoch}/{config.epochs}] "
+                      f"Batch [{batch_idx+1}/{len(train_loader)}] ({progress:.1f}%) | "
+                      f"Loss: {loss.item() * accum:.4f} | "
+                      f"LR: {current_lr:.2e} | "
+                      f"Time: {avg_batch_time:.2f}s/batch | "
+                      f"ETA: {format_time(eta)} | "
+                      f"GPU: {gpu_mem}")
+        
+        # Epoch summary
         avg_loss = epoch_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start_time
+        
+        print()
+        print("-" * 80)
+        print(f"EPOCH {epoch} SUMMARY")
+        print("-" * 80)
+        print(f"Average Loss: {avg_loss:.4f}")
+        print(f"Epoch Time: {format_time(epoch_time)}")
+        print(f"Samples/sec: {len(train_dataset) / epoch_time:.1f}")
+        print()
+        
+        # Evaluation
+        print("Running validation...")
         student_model.eval()
+        eval_start = time.time()
         recalls = evaluate(student_model, val_loader, device, config.temperature, tokenizer)
+        eval_time = time.time() - eval_start
         r10 = recalls['R@10']
-        print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | R@1: {recalls['R@1']:.3f} R@5: {recalls['R@5']:.3f} R@10: {recalls['R@10']:.3f}")
+        
+        print(f"Validation Results (took {format_time(eval_time)}):")
+        print(f"  R@1:  {recalls['R@1']:.3f}")
+        print(f"  R@5:  {recalls['R@5']:.3f}")
+        print(f"  R@10: {recalls['R@10']:.3f}")
+        
         if r10 > best_r10:
+            improvement = r10 - best_r10
             best_r10 = r10
-            torch.save({'model': student_model.state_dict(), 'config': config.__dict__}, os.path.join(save_dir, 'best.pt'))
+            save_path = os.path.join(save_dir, 'best.pt')
+            torch.save({'model': student_model.state_dict(), 'config': config.__dict__}, save_path)
+            print(f"✓ New best model saved! (R@10: {best_r10:.3f}, +{improvement:.3f})")
+        else:
+            print(f"  Best R@10: {best_r10:.3f} (no improvement)")
+        
+        print("=" * 80)
+        print()
+        
         student_model.train()
+    
+    print()
+    print("=" * 80)
+    print("TRAINING COMPLETED")
+    print("=" * 80)
+    print(f"Best R@10: {best_r10:.3f}")
+    print(f"Model saved to: {save_dir}")
+    print("=" * 80)
 
 
 def evaluate(model, loader: DataLoader, device: torch.device, temperature: float, tokenizer) -> Dict[str, float]:
