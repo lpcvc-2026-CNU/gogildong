@@ -214,7 +214,9 @@ def main(config: Config):
                 loss = contrastive_loss(img_embeds, txt_embeds, config.temperature)
                 if teacher_models:
                     for weight, teacher, tok in zip(config.distill_weights, teacher_models, teacher_tokenizers):
-                        texts_t = open_clip.tokenize(captions).to(device)
+                        # Teacher마다 text context length가 다를 수 있어
+                        # 해당 teacher의 tokenizer를 사용해야 길이(예: 64/77) 불일치가 나지 않는다.
+                        texts_t = tok(captions).to(device)
                         if texts_t.dim() == 3:
                             texts_t = texts_t.squeeze(1)
                         with torch.no_grad():
