@@ -161,9 +161,11 @@ def main(config: Config):
     for epoch in range(1, config.epochs + 1):
         student_model.train()
         total_loss = 0.0
-        for images, texts in train_loader:
+        for images, captions in train_loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
+            texts = tokenizer(captions).to(device)
+            if texts.dim() == 3:
+                texts = texts.squeeze(1)
             optimiser.zero_grad()
             with torch.amp.autocast('cuda', enabled=config.amp):
                 s_img, s_txt = student_model(images, texts)
@@ -182,7 +184,7 @@ def main(config: Config):
             total_loss += loss.item()
         avg_loss = total_loss / len(train_loader)
         student_model.eval()
-        metrics = evaluate(student_model, val_loader, device, config.temperature)
+        metrics = evaluate(student_model, val_loader, device, config.temperature, tokenizer)
         r10 = metrics['R@10']
         print(f"Epoch {epoch} | Loss {avg_loss:.4f} | R@1 {metrics['R@1']:.3f} | R@5 {metrics['R@5']:.3f} | R@10 {metrics['R@10']:.3f}")
         if r10 > best_r10:
@@ -191,13 +193,15 @@ def main(config: Config):
         student_model.train()
 
 
-def evaluate(model, loader: DataLoader, device: torch.device, temperature: float) -> Dict[str, float]:
+def evaluate(model, loader: DataLoader, device: torch.device, temperature: float, tokenizer) -> Dict[str, float]:
     img_list = []
     txt_list = []
     with torch.no_grad():
-        for images, texts in loader:
+        for images, captions in loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
+            texts = tokenizer(captions).to(device)
+            if texts.dim() == 3:
+                texts = texts.squeeze(1)
             s_img, s_txt = model(images, texts)
             img_list.append(F.normalize(s_img, dim=-1).cpu())
             txt_list.append(F.normalize(s_txt, dim=-1).cpu())

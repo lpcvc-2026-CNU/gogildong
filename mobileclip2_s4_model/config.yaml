@@ -21,7 +21,8 @@ model:
   temperature: 0.04                   # often lower for smaller models
 
 training:
-  batch_size: 256                      # MobileCLIP2-S4 is lighter; can use larger batch
+  batch_size: 4                      # per-step batch (VRAM 제한 시 축소)
+  accumulation_steps: 32             # gradient accumulation → effective batch = 4 * 32 = 128
   epochs: 12
   lr: 5.0e-4
   weight_decay: 0.2

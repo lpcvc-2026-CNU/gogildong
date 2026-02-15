@@ -131,8 +131,8 @@ class ImageTextDataset(Dataset):
         image_path = self.image_root / item['image']
         caption = item['caption']
         image = self.transform(Image.open(image_path).convert('RGB'))
-        text_inputs = self.tokenizer([caption])
-        return image, text_inputs
+        # 원문 캡션 반환 → 각 train 스크립트에서 해당 모델의 tokenizer로 토큰화 (context_length 호환)
+        return image, caption
 
 
 def build_annotations(

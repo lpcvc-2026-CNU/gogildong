@@ -65,6 +65,7 @@ class Config:
     clip_grad_norm: float
     amp: bool
     ema_decay: float
+    accumulation_steps: int
     save_dir: str
     onnx_dir: str
 
@@ -100,6 +101,7 @@ class Config:
             clip_grad_norm=float(train['clip_grad_norm']),
             amp=bool(train['amp']),
             ema_decay=float(train['ema_decay']),
+            accumulation_steps=int(train.get('accumulation_steps', 1)),
             save_dir=paths['save_dir'],
             onnx_dir=paths['onnx_dir'],
         )
@@ -121,6 +123,14 @@ def distillation_loss(student_feats: torch.Tensor, teacher_feats: torch.Tensor) 
     return F.mse_loss(student_feats, teacher_feats)
 
 
+def _model_features(model, images: torch.Tensor, texts) -> tuple:
+    """Return (image_features, text_features) from model; handles dict or tuple output (open_clip)."""
+    out = model(images, texts)
+    if isinstance(out, dict):
+        return out["image_features"], out["text_features"]
+    return out[0], out[1]
+
+
 def main(config: Config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Resolve paths relative to project root (works whether run from root or model subdir)
@@ -132,40 +142,36 @@ def main(config: Config):
     os.makedirs(save_dir, exist_ok=True)
     torch.cuda.empty_cache()
     # Load student
-    student_model, _, preprocess = open_clip.create_model_and_transforms(config.student_name, pretrained='dfndr2b', precision='fp32')
+    # 224로 통일해 teacher(ViT 224)와 호환 (student 기본 256이면 충돌 방지)
+    student_model, _, preprocess = open_clip.create_model_and_transforms(
+        config.student_name, pretrained='dfndr2b', precision='fp32', force_image_size=224
+    )
     tokenizer = open_clip.get_tokenizer(config.student_name)
     student_model.to(device)
     student_model.train()
-    # Load teachers
+    # Load teachers + 각 teacher용 tokenizer (context_length 64/77 등 호환)
     teacher_models = []
+    teacher_tokenizers = []
     if config.use_teacher:
         for i, name in enumerate(config.teacher_names):
             tag = config.pretrained_tags[i]
-            
             print(f"Loading Teacher {i+1}: {name} ({tag})...")
-            
-            # 기본 인자 설정
             kwargs = {
                 'model_name': name,
                 'pretrained': tag,
-                'precision': 'fp16'
+                'precision': 'fp16',
+                'force_image_size': 224,
             }
-            
-            # 특정 모델(ViT-L-14) 혹은 특정 태그(dfn2b)일 때만 force_quick_gelu 적용
             if 'ViT-L-14' in name and tag == 'dfn2b':
                 print(f"--> Applying force_quick_gelu=True for {name}")
                 kwargs['force_quick_gelu'] = True
-            
             model, _, _ = open_clip.create_model_and_transforms(**kwargs)
-            
             model.to(device)
             model.eval()
-            
-            # 선생 가중치 고정
             for param in model.parameters():
                 param.requires_grad = False
-                
             teacher_models.append(model)
+            teacher_tokenizers.append(open_clip.get_tokenizer(name))
         assert len(config.distill_weights) == len(teacher_models), "Number of distill_weights must match teacher_names"
     torch.cuda.empty_cache()
 
@@ -186,36 +192,47 @@ def main(config: Config):
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     # Optimiser
     optimiser = torch.optim.AdamW(student_model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    total_steps = config.epochs * len(train_loader)
+    accum = config.accumulation_steps
+    steps_per_epoch = (len(train_loader) + accum - 1) // accum  # optimizer steps per epoch
+    total_steps = config.epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=total_steps)
     scaler = torch.amp.GradScaler('cuda', enabled=config.amp)
     best_r10 = 0.0
     for epoch in range(1, config.epochs + 1):
         student_model.train()
         epoch_loss = 0.0
-        for images, texts in train_loader:
+        for batch_idx, (images, captions) in enumerate(train_loader):
+            if batch_idx % accum == 0:
+                optimiser.zero_grad()
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
-            optimiser.zero_grad()
+            # 원문 캡션 → 각 모델의 tokenizer로 토큰화 (context_length 64/77 등 호환)
+            texts_student = tokenizer(captions).to(device)
+            if texts_student.dim() == 3:
+                texts_student = texts_student.squeeze(1)
             with torch.amp.autocast('cuda', enabled=config.amp):
-                img_embeds, txt_embeds = student_model(images, texts)
+                img_embeds, txt_embeds = _model_features(student_model, images, texts_student)
                 loss = contrastive_loss(img_embeds, txt_embeds, config.temperature)
                 if teacher_models:
-                    for weight, teacher in zip(config.distill_weights, teacher_models):
+                    for weight, teacher, tok in zip(config.distill_weights, teacher_models, teacher_tokenizers):
+                        texts_t = open_clip.tokenize(captions).to(device)
+                        if texts_t.dim() == 3:
+                            texts_t = texts_t.squeeze(1)
                         with torch.no_grad():
-                            t_img, t_txt = teacher(images, texts)
+                            t_img, t_txt = _model_features(teacher, images, texts_t)
                         loss += weight * (distillation_loss(img_embeds, t_img) + distillation_loss(txt_embeds, t_txt))
+                loss = loss / accum
             scaler.scale(loss).backward()
-            if config.clip_grad_norm > 0:
-                scaler.unscale_(optimiser)
-                torch.nn.utils.clip_grad_norm_(student_model.parameters(), config.clip_grad_norm)
-            scaler.step(optimiser)
-            scaler.update()
-            scheduler.step()
-            epoch_loss += loss.item()
+            if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == len(train_loader):
+                if config.clip_grad_norm > 0:
+                    scaler.unscale_(optimiser)
+                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), config.clip_grad_norm)
+                scaler.step(optimiser)
+                scaler.update()
+                scheduler.step()
+            epoch_loss += loss.item() * accum
         avg_loss = epoch_loss / len(train_loader)
         student_model.eval()
-        recalls = evaluate(student_model, val_loader, device, config.temperature)
+        recalls = evaluate(student_model, val_loader, device, config.temperature, tokenizer)
         r10 = recalls['R@10']
         print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | R@1: {recalls['R@1']:.3f} R@5: {recalls['R@5']:.3f} R@10: {recalls['R@10']:.3f}")
         if r10 > best_r10:
@@ -224,14 +241,16 @@ def main(config: Config):
         student_model.train()
 
 
-def evaluate(model, loader: DataLoader, device: torch.device, temperature: float) -> Dict[str, float]:
+def evaluate(model, loader: DataLoader, device: torch.device, temperature: float, tokenizer) -> Dict[str, float]:
     all_img = []
     all_txt = []
     with torch.no_grad():
-        for images, texts in loader:
+        for images, captions in loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
-            img_feats, txt_feats = model(images, texts)
+            texts = tokenizer(captions).to(device)
+            if texts.dim() == 3:
+                texts = texts.squeeze(1)
+            img_feats, txt_feats = _model_features(model, images, texts)
             img_feats = F.normalize(img_feats, dim=-1)
             txt_feats = F.normalize(txt_feats, dim=-1)
             all_img.append(img_feats.cpu())

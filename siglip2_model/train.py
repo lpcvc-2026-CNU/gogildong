@@ -173,9 +173,11 @@ def main(config: Config):
     for epoch in range(1, config.epochs + 1):
         student_model.train()
         epoch_loss = 0.0
-        for images, texts in train_loader:
+        for images, captions in train_loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
+            texts = tokenizer(captions).to(device)
+            if texts.dim() == 3:
+                texts = texts.squeeze(1)
             optimiser.zero_grad()
             with torch.amp.autocast('cuda', enabled=config.amp):
                 image_embeds, text_embeds = student_model(images, texts)
@@ -197,7 +199,7 @@ def main(config: Config):
         avg_loss = epoch_loss / len(train_loader)
         # Validation
         student_model.eval()
-        recalls = evaluate(student_model, val_loader, device, config.temperature)
+        recalls = evaluate(student_model, val_loader, device, config.temperature, tokenizer)
         recall10 = recalls['R@10']
         print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | Recall@1: {recalls['R@1']:.3f} R@5: {recalls['R@5']:.3f} R@10: {recalls['R@10']:.3f}")
         if recall10 > best_recall10:
@@ -206,15 +208,16 @@ def main(config: Config):
         student_model.train()
 
 
-def evaluate(model, loader: DataLoader, device: torch.device, temperature: float) -> Dict[str, float]:
+def evaluate(model, loader: DataLoader, device: torch.device, temperature: float, tokenizer) -> Dict[str, float]:
     """Compute recall@1/5/10 for a validation set."""
-    # Collect all embeddings
     all_image_embeds = []
     all_text_embeds = []
     with torch.no_grad():
-        for images, texts in loader:
+        for images, captions in loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
+            texts = tokenizer(captions).to(device)
+            if texts.dim() == 3:
+                texts = texts.squeeze(1)
             img_feats, txt_feats = model(images, texts)
             img_feats = F.normalize(img_feats, dim=-1)
             txt_feats = F.normalize(txt_feats, dim=-1)
