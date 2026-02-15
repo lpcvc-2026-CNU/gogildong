@@ -12,13 +12,25 @@ augmentation, distributed training and other techniques as needed.
 
 import argparse
 import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 from dataset_loader import ImageTextDataset, build_annotations
+
+
+def _resolve_path(path: Optional[str]) -> Optional[str]:
+    """Resolve config path relative to project root so it works from any cwd."""
+    if not path:
+        return path
+    p = Path(path)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return str(p.resolve())
 
 import torch
 import torch.nn.functional as F
@@ -40,6 +52,7 @@ class Config:
     val_split: float
     student_name: str
     teacher_names: List[str]
+    pretrained_tags: list
     embed_dim: int
     temperature: float
     batch_size: int
@@ -74,6 +87,7 @@ class Config:
             val_split=float(data.get('val_split', 0.05)),
             student_name=model['student_name'],
             teacher_names=model.get('teacher_names', []),
+            pretrained_tags=model.get('pretrained_tags', []),
             embed_dim=model['embed_dim'],
             temperature=float(model['temperature']),
             batch_size=int(train['batch_size']),
@@ -109,32 +123,62 @@ def distillation_loss(student_feats: torch.Tensor, teacher_feats: torch.Tensor) 
 
 def main(config: Config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(config.save_dir, exist_ok=True)
+    # Resolve paths relative to project root (works whether run from root or model subdir)
+    image_root = _resolve_path(config.image_root)
+    captions_json = _resolve_path(config.captions_json)
+    coco_annotations = _resolve_path(config.coco_annotations)
+    csv_path = _resolve_path(config.csv_path)
+    save_dir = _resolve_path(config.save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    torch.cuda.empty_cache()
     # Load student
-    student_model, _, preprocess = open_clip.create_model_and_transforms(config.student_name, pretrained=None, precision='fp32')
+    student_model, _, preprocess = open_clip.create_model_and_transforms(config.student_name, pretrained='dfndr2b', precision='fp32')
     tokenizer = open_clip.get_tokenizer(config.student_name)
     student_model.to(device)
     student_model.train()
     # Load teachers
     teacher_models = []
     if config.use_teacher:
-        for name in config.teacher_names:
-            model, _, _ = open_clip.create_model_and_transforms(name, pretrained=None, precision='fp32')
+        for i, name in enumerate(config.teacher_names):
+            tag = config.pretrained_tags[i]
+            
+            print(f"Loading Teacher {i+1}: {name} ({tag})...")
+            
+            # 기본 인자 설정
+            kwargs = {
+                'model_name': name,
+                'pretrained': tag,
+                'precision': 'fp16'
+            }
+            
+            # 특정 모델(ViT-L-14) 혹은 특정 태그(dfn2b)일 때만 force_quick_gelu 적용
+            if 'ViT-L-14' in name and tag == 'dfn2b':
+                print(f"--> Applying force_quick_gelu=True for {name}")
+                kwargs['force_quick_gelu'] = True
+            
+            model, _, _ = open_clip.create_model_and_transforms(**kwargs)
+            
             model.to(device)
             model.eval()
+            
+            # 선생 가중치 고정
+            for param in model.parameters():
+                param.requires_grad = False
+                
             teacher_models.append(model)
         assert len(config.distill_weights) == len(teacher_models), "Number of distill_weights must match teacher_names"
+    torch.cuda.empty_cache()
 
     # Dataset (json / coco / csv). filter_missing=True 시 존재하는 이미지 쌍만 사용.
     annotations = build_annotations(
         config.dataset_type,
-        config.image_root,
-        captions_json=config.captions_json,
-        coco_annotations=config.coco_annotations,
-        csv_path=config.csv_path,
+        image_root,
+        captions_json=captions_json,
+        coco_annotations=coco_annotations,
+        csv_path=csv_path,
         filter_missing=config.filter_missing,
     )
-    dataset = ImageTextDataset(config.image_root, annotations, preprocess, tokenizer)
+    dataset = ImageTextDataset(image_root, annotations, preprocess, tokenizer)
     val_size = int(len(dataset) * config.val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -144,16 +188,16 @@ def main(config: Config):
     optimiser = torch.optim.AdamW(student_model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     total_steps = config.epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=config.amp)
     best_r10 = 0.0
     for epoch in range(1, config.epochs + 1):
         student_model.train()
         epoch_loss = 0.0
         for images, texts in train_loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()}
+            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
             optimiser.zero_grad()
-            with torch.cuda.amp.autocast(enabled=config.amp):
+            with torch.amp.autocast('cuda', enabled=config.amp):
                 img_embeds, txt_embeds = student_model(images, texts)
                 loss = contrastive_loss(img_embeds, txt_embeds, config.temperature)
                 if teacher_models:
@@ -176,7 +220,7 @@ def main(config: Config):
         print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | R@1: {recalls['R@1']:.3f} R@5: {recalls['R@5']:.3f} R@10: {recalls['R@10']:.3f}")
         if r10 > best_r10:
             best_r10 = r10
-            torch.save({'model': student_model.state_dict(), 'config': config.__dict__}, os.path.join(config.save_dir, 'best.pt'))
+            torch.save({'model': student_model.state_dict(), 'config': config.__dict__}, os.path.join(save_dir, 'best.pt'))
         student_model.train()
 
 
@@ -186,7 +230,7 @@ def evaluate(model, loader: DataLoader, device: torch.device, temperature: float
     with torch.no_grad():
         for images, texts in loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()}
+            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
             img_feats, txt_feats = model(images, texts)
             img_feats = F.normalize(img_feats, dim=-1)
             txt_feats = F.normalize(txt_feats, dim=-1)
@@ -208,5 +252,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train MobileCLIP2‑S4 model')
     parser.add_argument('--config', type=str, default='config.yaml')
     args = parser.parse_args()
-    cfg = Config.from_yaml(args.config)
+    config_path = Path(args.config)
+    if not config_path.is_absolute() and not (Path.cwd() / config_path).exists():
+        config_path = Path(__file__).resolve().parent / config_path
+    cfg = Config.from_yaml(str(config_path.resolve()))
     main(cfg)

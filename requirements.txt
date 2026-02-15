@@ -6,9 +6,6 @@ torch>=2.2.0
 torchvision>=0.17.0
 torchaudio>=2.2.0
 
-# CUDA build는 환경에 따라 자동 선택
-# (GPU 없으면 CPU version 설치됨)
-
 
 # ================================
 # CLIP / SigLIP / EVA / MobileCLIP
@@ -18,7 +15,6 @@ open_clip_torch>=2.24.0
 transformers>=4.42.0
 timm>=1.0.7
 
-# 일부 MobileCLIP / EVA 모델에서 필요
 sentencepiece>=0.2.0
 ftfy>=6.1.1
 

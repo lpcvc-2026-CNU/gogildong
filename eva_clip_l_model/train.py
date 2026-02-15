@@ -16,8 +16,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 from dataset_loader import ImageTextDataset, build_annotations
+
+
+def _resolve_path(path: Optional[str]) -> Optional[str]:
+    """Resolve config path relative to project root so it works from any cwd."""
+    if not path:
+        return path
+    p = Path(path)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return str(p.resolve())
 
 import torch
 import torch.nn.functional as F
@@ -108,7 +119,13 @@ def distillation_loss(student_feats: torch.Tensor, teacher_feats: torch.Tensor) 
 
 def main(config: Config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(config.save_dir, exist_ok=True)
+    # Resolve paths relative to project root (works whether run from root or model subdir)
+    image_root = _resolve_path(config.image_root)
+    captions_json = _resolve_path(config.captions_json)
+    coco_annotations = _resolve_path(config.coco_annotations)
+    csv_path = _resolve_path(config.csv_path)
+    save_dir = _resolve_path(config.save_dir)
+    os.makedirs(save_dir, exist_ok=True)
     # Load student
     student_model, _, preprocess = open_clip.create_model_and_transforms(config.student_name, pretrained=None, precision='fp32')
     tokenizer = open_clip.get_tokenizer(config.student_name)
@@ -123,13 +140,13 @@ def main(config: Config):
     # Dataset (json / coco / csv). filter_missing=True 시 존재하는 이미지 쌍만 사용.
     annotations = build_annotations(
         config.dataset_type,
-        config.image_root,
-        captions_json=config.captions_json,
-        coco_annotations=config.coco_annotations,
-        csv_path=config.csv_path,
+        image_root,
+        captions_json=captions_json,
+        coco_annotations=coco_annotations,
+        csv_path=csv_path,
         filter_missing=config.filter_missing,
     )
-    dataset = ImageTextDataset(config.image_root, annotations, preprocess, tokenizer)
+    dataset = ImageTextDataset(image_root, annotations, preprocess, tokenizer)
     val_size = int(len(dataset) * config.val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -139,16 +156,16 @@ def main(config: Config):
     optimiser = torch.optim.AdamW(student_model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     total_steps = config.epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=config.amp)
     best_r10 = 0.0
     for epoch in range(1, config.epochs + 1):
         student_model.train()
         total_loss = 0.0
         for images, texts in train_loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()}
+            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
             optimiser.zero_grad()
-            with torch.cuda.amp.autocast(enabled=config.amp):
+            with torch.amp.autocast('cuda', enabled=config.amp):
                 s_img, s_txt = student_model(images, texts)
                 loss = contrastive_loss(s_img, s_txt, config.temperature)
                 if teacher_model is not None:
@@ -170,7 +187,7 @@ def main(config: Config):
         print(f"Epoch {epoch} | Loss {avg_loss:.4f} | R@1 {metrics['R@1']:.3f} | R@5 {metrics['R@5']:.3f} | R@10 {metrics['R@10']:.3f}")
         if r10 > best_r10:
             best_r10 = r10
-            torch.save({'model': student_model.state_dict(), 'config': config.__dict__}, os.path.join(config.save_dir, 'best.pt'))
+            torch.save({'model': student_model.state_dict(), 'config': config.__dict__}, os.path.join(save_dir, 'best.pt'))
         student_model.train()
 
 
@@ -180,7 +197,7 @@ def evaluate(model, loader: DataLoader, device: torch.device, temperature: float
     with torch.no_grad():
         for images, texts in loader:
             images = images.to(device)
-            texts = {k: v.to(device) for k, v in texts.items()}
+            texts = {k: v.to(device) for k, v in texts.items()} if isinstance(texts, dict) else texts.to(device)
             s_img, s_txt = model(images, texts)
             img_list.append(F.normalize(s_img, dim=-1).cpu())
             txt_list.append(F.normalize(s_txt, dim=-1).cpu())
@@ -200,5 +217,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train EVA‑02‑CLIP‑L model')
     parser.add_argument('--config', type=str, default='config.yaml')
     args = parser.parse_args()
-    cfg = Config.from_yaml(args.config)
+    config_path = Path(args.config)
+    if not config_path.is_absolute() and not (Path.cwd() / config_path).exists():
+        config_path = Path(__file__).resolve().parent / config_path
+    cfg = Config.from_yaml(str(config_path.resolve()))
     main(cfg)

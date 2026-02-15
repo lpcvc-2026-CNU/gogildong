@@ -3,16 +3,20 @@
 # Expected layout: DATASET.md in project root
 
 data:
-  dataset_type: json                   # "json" | "coco" | "csv"
-  image_root: ./data/images
-  captions_json: ./data/captions.json
+  dataset_type: coco                   # "json" | "coco" | "csv" — 실제 구조: dataset/coco/
+  image_root: dataset/coco/train2017
+  coco_annotations: dataset/coco/annotations/captions_train2017.json
   filter_missing: true                 # true: 이미지 존재하는 쌍만 사용 (캡션/이미지 수 불일치 대응)
+  # json: image_root: dataset/images, captions_json: dataset/captions.json
   # csv_path: dataset/data2/dataset_zip/lpcvc_300k_master_fixed.csv  # dataset_type: csv, image_root: dataset/data2/dataset_zip
   val_split: 0.05
 
 model:
-  student_name: mobileclip2_s4         # open_clip MobileCLIP2-S4 (~50M params)
-  teacher_names: [siglip2_so400m_14, dfn_vit_l_14]  # two teachers for dual distillation
+  student_name: MobileCLIP2-S4         # open_clip MobileCLIP2-S4 (~50M params)
+  teacher_names: [ViT-SO400M-14-SigLIP2, ViT-L-14]  # two teachers for dual distillation
+  pretrained_tags:
+  - "webli"
+  - "dfn2b"
   embed_dim: 512
   temperature: 0.04                   # often lower for smaller models
 

@@ -17,12 +17,12 @@
 
 1. **이미지 디렉터리**  
    - `config.yaml`의 `data.image_root`에 지정한 경로  
-   - 예: `./data/images/`  
+   - 예: `dataset/images/` (프로젝트 루트 기준)  
    - 내부에 학습/검증용 이미지 파일 (예: JPEG/PNG)
 
 2. **캡션 JSON**  
    - `config.yaml`의 `data.captions_json`에 지정한 경로  
-   - 예: `./data/captions.json`  
+   - 예: `dataset/captions.json`  
    - 형식: 이미지 파일명과 캡션의 리스트
 
 ```json
@@ -39,18 +39,18 @@
 
 ## 설정 방법
 
-1. 대회에서 제공하는 데이터를 다운로드한 뒤, 위 구조에 맞게  
-   - 이미지를 `image_root` 아래에 두고  
-   - 같은 순서/매핑으로 `captions.json`을 만듭니다.
+1. 대회에서 제공하는 데이터를 다운로드한 뒤, 프로젝트 루트의 **`dataset`** 폴더 아래에  
+   - 이미지를 `dataset/images` 등 `image_root`에 지정할 경로에 두고  
+   - 같은 순서/매핑으로 `captions.json`(예: `dataset/captions.json`)을 만듭니다.
 2. 각 모델 디렉터리(`siglip2_model`, `mobileclip2_s4_model`, `eva_clip_l_model`)의  
-   `config.yaml`에서 `data.image_root`와 `data.captions_json`을 실제 경로로 수정합니다.
+   `config.yaml`에서 `data.image_root`와 `data.captions_json`을 위 경로에 맞게 수정합니다.
 
-예시 (공통 데이터를 쓰는 경우):
+예시 (프로젝트 루트의 `dataset` 폴더를 쓰는 경우):
 
 ```yaml
 data:
-  image_root: /path/to/lpcv2026/images
-  captions_json: /path/to/lpcv2026/captions.json
+  image_root: dataset/images
+  captions_json: dataset/captions.json
   val_split: 0.05
 ```
 
@@ -62,18 +62,19 @@ data:
 
 프로젝트 루트의 **`dataset`** 폴더에 MS COCO 데이터셋을 두면, 동일한 학습 스크립트로 COCO 캡션 데이터를 사용할 수 있습니다.
 
-### 디렉터리 구조 예시
+### 디렉터리 구조 예시 (이 레포 실제 구조: `dataset/coco/`)
 
 ```
 gogildong/
   dataset/
-    train2017/          # 학습 이미지 (또는 train2014)
-      COCO_train2017_000000xxx.jpg
-    val2017/
-      COCO_val2017_000000xxx.jpg
-    annotations/
-      captions_train2017.json
-      captions_val2017.json
+    coco/
+      train2017/        # 학습 이미지
+        COCO_train2017_000000xxx.jpg
+      val2017/
+        COCO_val2017_000000xxx.jpg
+      annotations/
+        captions_train2017.json
+        captions_val2017.json
 ```
 
 COCO 캡션 JSON 형식은 [공식 설명](https://cocodataset.org/#format-data)과 같습니다.  
@@ -86,8 +87,8 @@ COCO 캡션 JSON 형식은 [공식 설명](https://cocodataset.org/#format-data)
 ```yaml
 data:
   dataset_type: coco
-  image_root: dataset/train2017
-  coco_annotations: dataset/annotations/captions_train2017.json
+  image_root: dataset/coco/train2017
+  coco_annotations: dataset/coco/annotations/captions_train2017.json
   val_split: 0.05
 ```
 
