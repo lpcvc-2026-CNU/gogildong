@@ -217,6 +217,12 @@ def main(config: Config):
         assert len(config.distill_weights) == len(teacher_models), "Number of distill_weights must match teacher_names"
     torch.cuda.empty_cache()
 
+    # Teacher 1 (SigLIP2: 1152)용 프로젝션
+    proj_t1 = torch.nn.Linear(768, 1152).to(device)
+
+    # Teacher 2 (ViT-L-14)
+    proj_t2 = torch.nn.Linear(768, 768).to(device)
+
     # Dataset (json / coco / csv). filter_missing=True 시 존재하는 이미지 쌍만 사용.
     annotations = build_annotations(
         config.dataset_type,
@@ -233,7 +239,8 @@ def main(config: Config):
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     # Optimiser
-    optimiser = torch.optim.AdamW(student_model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    params = list(student_model.parameters()) + list(proj_t1.parameters()) + list(proj_t2.parameters())
+    optimiser = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
     accum = config.accumulation_steps
     steps_per_epoch = (len(train_loader) + accum - 1) // accum  # optimizer steps per epoch
     total_steps = config.epochs * steps_per_epoch
@@ -253,13 +260,31 @@ def main(config: Config):
                 img_embeds, txt_embeds = _model_features(student_model, images, texts_student)
                 loss = contrastive_loss(img_embeds, txt_embeds, config.temperature)
                 if teacher_models:
-                    for weight, teacher, tok in zip(config.distill_weights, teacher_models, teacher_tokenizers):
-                        # Teacher마다 text context length가 다를 수 있어
-                        # 해당 teacher의 tokenizer를 사용해야 길이(예: 64/77) 불일치가 나지 않는다.
+                    # 루프에서 i(인덱스)를 추가하여 어떤 스승인지 식별합니다.
+                    for i, (weight, teacher, tok) in enumerate(zip(config.distill_weights, teacher_models, teacher_tokenizers)):
+                        
+                        # 1. 각 스승에 맞는 텍스트 토크나이징 및 특징 추출
                         texts_t = _tokenize_texts(tok, captions, device, context_length=getattr(teacher, 'context_length', None))
                         with torch.no_grad():
                             t_img, t_txt = _model_features(teacher, images, texts_t)
-                        loss += weight * (distillation_loss(img_embeds, t_img) + distillation_loss(txt_embeds, t_txt))
+                        
+                        # 2. 학생의 임베딩(768)을 스승의 차원에 맞게 투영(Projection)
+                        # i=0: SigLIP2 (1152), i=1: ViT-L-14 (768)
+                        if i == 0:
+                            # 첫 번째 스승용 투영 레이어 적용 (768 -> 1152)
+                            s_img_proj = proj_t1(img_embeds)
+                            s_txt_proj = proj_t1(txt_embeds)
+                        else:
+                            # 두 번째 스승용 투영 레이어 적용 (768 -> 768)
+                            # 사실 차원이 같으면 레이어가 없어도 되지만, 
+                            # 별도의 학습 가능한 레이어를 두는 것이 증류 성능에 더 유리할 때가 많습니다.
+                            s_img_proj = proj_t2(img_embeds)
+                            s_txt_proj = proj_t2(txt_embeds)
+                            
+                        # 3. 투영된 벡터와 스승의 벡터로 Loss 계산
+                        loss += weight * (distillation_loss(s_img_proj, t_img) + distillation_loss(s_txt_proj, t_txt))
+
+                # Gradient Accumulation 적용
                 loss = loss / accum
             scaler.scale(loss).backward()
             if (batch_idx + 1) % accum == 0 or (batch_idx + 1) == len(train_loader):
