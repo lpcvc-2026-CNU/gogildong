@@ -12,8 +12,8 @@ data:
   val_split: 0.05
 
 model:
-  student_name: eva02_clip_l_14       # open_clip EVA-02-CLIP-L/14 (~428M params)
-  teacher_name: eva02_clip_e_14       # optional larger teacher; set null to disable
+  student_name: ViT-S-16      # open_clip ViT-S-16
+  teacher_name: EVA02-E-14-plus      # optional larger teacher; set null to disable
   embed_dim: 768                      # EVA-L embedding dimension
   temperature: 0.02                   # lower temperature common for larger CLIPs
 
