@@ -1,3 +1,5 @@
 dataset/
 .venv/
 __pycache__/
+vit_s_16/exported_onnx
+runs

@@ -1,6 +1,7 @@
-# EVA-02-CLIP-L — LPCV 2026 Image-Text Retrieval
+# ViT-S/16 — LPCV 2026 Image-Text Retrieval (single-teacher distillation)
 # Dataset: https://lpcv.ai/2026LPCVC/image-text-retrieval/
 # Expected layout: DATASET.md in project root
+# Hardware target: RTX 4070 (12 GB VRAM)
 
 data:
   dataset_type: coco                   # "json" | "coco" | "csv" — 실제 구조: dataset/coco/
@@ -12,23 +13,27 @@ data:
   val_split: 0.05
 
 model:
-  student_name: ViT-S-16      # open_clip ViT-S-16
-  teacher_name: EVA02-E-14-plus      # optional larger teacher; set null to disable
-  embed_dim: 768                      # EVA-L embedding dimension
-  temperature: 0.02                   # lower temperature common for larger CLIPs
+  student_name: ViT-S-16               # open_clip ViT-S/16 (~22M params, very mobile-friendly)
+  teacher_name: EVA02-E-14-plus        # single teacher: EVA-02-E-14+ (~4.4B params, fp16 on RTX 4070)
+  pretrained_tag: laion2b_s9b_b144k    # standard pretrained tag for EVA02-E-14-plus
+  embed_dim: 512                       # ViT-S/16 embedding dimension
+  temperature: 0.05                    # slightly lower than siglip for small model
 
 training:
-  batch_size: 64                      # smaller batch due to model size (reduce if OOM)
-  epochs: 8
-  lr: 2.0e-4                          # lower lr for larger model
-  weight_decay: 0.1
-  warmup: 500
+  batch_size: 4                       # RTX 4070 12GB: student(22M fp32) + teacher(E-14+ fp16) fits at 16
+                                       # reduce to 8 if OOM; increase to 32 after confirming train time
+  # accumulation_steps: not applied yet — enable after checking train time per epoch
+  epochs: 15
+  lr: 5.0e-4
+  weight_decay: 0.2
+  warmup: 1000
   use_teacher: true
-  distill_weight: 0.5
+  distill_weight: 0.5                  # single weight for the one teacher
   clip_grad_norm: 1.0
-  amp: true
-  ema_decay: 0.999
+  amp: true                            # fp16 AMP — essential with the large teacher on 12GB
+  ema_decay: 0.9995
+  log_interval: 2                     # print progress every N batches
 
 paths:
-  save_dir: runs/eva_clip_l
+  save_dir: runs/vit_s_16
   onnx_dir: exported_onnx
