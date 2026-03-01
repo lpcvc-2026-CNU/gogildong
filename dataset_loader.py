@@ -11,7 +11,8 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-from torch.utils.data import Dataset
+import torch
+from torch.utils.data import Dataset, Subset
 from torchvision import transforms
 from PIL import Image
 
@@ -173,3 +174,42 @@ def build_annotations(
             "Check image_root and that image files exist, or set filter_missing: false."
         )
     return pairs
+
+
+def build_random_subset(dataset: Dataset, subset_size: int, seed: int = 42) -> Subset:
+    """Return a reproducible random Subset of *dataset* with exactly *subset_size* samples.
+
+    Uses a seeded generator so the same subset is selected every run, making
+    experiments reproducible.  If *subset_size* >= len(dataset) the original
+    dataset is returned unchanged.
+
+    Args:
+        dataset:     Any torch Dataset (or Subset thereof).
+        subset_size: Number of samples to keep.
+        seed:        Random seed for index permutation.
+
+    Returns:
+        A torch.utils.data.Subset wrapping *dataset*.
+    """
+    total = len(dataset)
+    if subset_size >= total:
+        msg = (
+            f"build_random_subset: subset_size={subset_size} >= dataset size={total}; "
+            "returning the full dataset."
+        )
+        log.info(msg)
+        print(msg)
+        return dataset  # type: ignore[return-value]
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+    indices = torch.randperm(total, generator=g)[:subset_size].tolist()
+
+    msg = (
+        f"build_random_subset: selected {subset_size:,} / {total:,} samples "
+        f"(seed={seed})"
+    )
+    log.info(msg)
+    print(msg)
+
+    return Subset(dataset, indices)

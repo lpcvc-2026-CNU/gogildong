@@ -3,22 +3,26 @@
 Hardware target: RTX 4070 (12 GB VRAM).
   - Student  : ViT-S/16, fp32  (~22M params)
   - Teacher  : EVA02-E-14-plus, fp16 (~4.4B params, frozen)
-  - No gradient accumulation (add later after checking train time)
+  - Gradient accumulation: controlled by config.training.accumulation_steps
+  - Warmup: linear for warmup_ratio × total_optimizer_steps, then cosine decay
+  - Subset: randomly sample config.data.subset_size train pairs (reproducible)
 
 Supports json / coco / csv dataset formats defined in dataset_loader.py.
-Progress is printed every `log_interval` batches with a live bar.
+Progress is printed every `log_interval` micro-batches with a live bar.
 
 Usage:
-    # From project root:
-    python vit_s_16_model/train.py --config vit_s_16_model/config.yaml
+    # From project root (recommended)
+    python vit_s_16/train.py --config vit_s_16/config.yaml
 
-    # From model subdirectory:
+    # From the model subdirectory
+    cd vit_s_16
     python train.py --config config.yaml
 """
 
 import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -30,7 +34,7 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
-from dataset_loader import ImageTextDataset, build_annotations
+from dataset_loader import ImageTextDataset, build_annotations, build_random_subset
 
 
 def _resolve_path(path: Optional[str]) -> Optional[str]:
@@ -42,6 +46,7 @@ def _resolve_path(path: Optional[str]) -> Optional[str]:
     return str(p.resolve())
 
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
@@ -50,11 +55,28 @@ import open_clip
 
 
 # ---------------------------------------------------------------------------
+# Reproducibility helper
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int) -> None:
+    """Fix Python / NumPy / PyTorch random state for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Deterministic cuDNN (may slow down training slightly)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Config:
+    # data
     dataset_type: str
     image_root: str
     captions_json: Optional[str]
@@ -62,24 +84,31 @@ class Config:
     csv_path: Optional[str]
     filter_missing: bool
     val_split: float
+    subset_size: Optional[int]        # None → use entire train split
+    # model
     student_name: str
     teacher_name: str
     pretrained_tag: str
     embed_dim: int
     temperature: float
+    # training
     batch_size: int
+    accumulation_steps: int           # micro-batches per optimizer step
     epochs: int
     lr: float
     weight_decay: float
-    warmup: int
+    warmup_ratio: float               # fraction of total optimizer steps → linear warmup
     use_teacher: bool
     distill_weight: float
     clip_grad_norm: float
     amp: bool
     ema_decay: float
+    log_interval: int
+    # paths
     save_dir: str
     onnx_dir: str
-    log_interval: int = 10
+    # global
+    seed: int = 42
 
     @staticmethod
     def from_yaml(path: str) -> "Config":
@@ -90,6 +119,10 @@ class Config:
         model = cfg["model"]
         train = cfg["training"]
         paths = cfg["paths"]
+
+        raw_subset = data.get("subset_size")
+        subset_size = int(raw_subset) if raw_subset is not None else None
+
         return Config(
             dataset_type     = str(data.get("dataset_type", "json")),
             image_root       = data["image_root"],
@@ -98,24 +131,27 @@ class Config:
             csv_path         = data.get("csv_path"),
             filter_missing   = bool(data.get("filter_missing", True)),
             val_split        = float(data.get("val_split", 0.05)),
+            subset_size      = subset_size,
             student_name     = model["student_name"],
             teacher_name     = model["teacher_name"],
             pretrained_tag   = model["pretrained_tag"],
             embed_dim        = model["embed_dim"],
             temperature      = float(model["temperature"]),
             batch_size       = int(train["batch_size"]),
+            accumulation_steps = int(train.get("accumulation_steps", 1)),
             epochs           = int(train["epochs"]),
             lr               = float(train["lr"]),
             weight_decay     = float(train["weight_decay"]),
-            warmup           = int(train["warmup"]),
+            warmup_ratio     = float(train.get("warmup_ratio", 0.1)),
             use_teacher      = bool(train["use_teacher"]),
             distill_weight   = float(train["distill_weight"]),
             clip_grad_norm   = float(train["clip_grad_norm"]),
             amp              = bool(train["amp"]),
             ema_decay        = float(train["ema_decay"]),
+            log_interval     = int(train.get("log_interval", 10)),
             save_dir         = paths["save_dir"],
             onnx_dir         = paths["onnx_dir"],
-            log_interval     = int(train.get("log_interval", 10)),
+            seed             = int(cfg.get("seed", 42)),
         )
 
 
@@ -225,6 +261,9 @@ def evaluate(model, loader: DataLoader, device: torch.device,
 # ---------------------------------------------------------------------------
 
 def main(config: Config) -> None:
+    # ── Seed ────────────────────────────────────────────────────────────────
+    set_seed(config.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     image_root       = _resolve_path(config.image_root)
@@ -235,10 +274,13 @@ def main(config: Config) -> None:
     os.makedirs(save_dir, exist_ok=True)
     torch.cuda.empty_cache()
 
+    accum = config.accumulation_steps
+
     # ── Banner ──────────────────────────────────────────────────────────────
     bar()
     print("  ViT-S/16  |  LPCVC 2026 Image-Text Retrieval  |  Training", flush=True)
     bar()
+    print(f"  Seed            : {config.seed}", flush=True)
     print(f"  Device          : {device}", flush=True)
     print(f"  Student         : {config.student_name}", flush=True)
     if config.use_teacher:
@@ -246,11 +288,15 @@ def main(config: Config) -> None:
         print(f"  Distill weight  : {config.distill_weight}", flush=True)
     else:
         print("  Teacher         : None (contrastive only)", flush=True)
-    print(f"  Batch size      : {config.batch_size}", flush=True)
+    print(f"  Micro-batch     : {config.batch_size}", flush=True)
+    print(f"  Accum steps     : {accum}", flush=True)
+    print(f"  Effective batch : {config.batch_size * accum}", flush=True)
     print(f"  Epochs          : {config.epochs}", flush=True)
     print(f"  Learning rate   : {config.lr}", flush=True)
+    print(f"  Warmup ratio    : {config.warmup_ratio}  (→ computed after dataset load)", flush=True)
     print(f"  Temperature     : {config.temperature}", flush=True)
     print(f"  AMP             : {config.amp}", flush=True)
+    print(f"  Subset size     : {config.subset_size if config.subset_size else 'all'}", flush=True)
     print(f"  Save dir        : {save_dir}", flush=True)
     bar()
     print()
@@ -266,8 +312,7 @@ def main(config: Config) -> None:
     total_p     = sum(p.numel() for p in student.parameters()) / 1e6
     trainable_p = sum(p.numel() for p in student.parameters() if p.requires_grad) / 1e6
 
-    # Probe actual student output dim — do NOT use config.embed_dim which may be wrong
-    # (e.g. ViT-S/16 outputs 384, but config may say 512)
+    # Probe actual student output dim
     student.eval()
     with torch.no_grad():
         _di = torch.zeros(1, 3, 224, 224, device=device)
@@ -281,7 +326,7 @@ def main(config: Config) -> None:
     # ── Teacher (single, frozen, fp16) ──────────────────────────────────────
     teacher     = None
     teacher_tok = None
-    proj        = None   # linear projection: student_dim → teacher_dim
+    proj        = None
 
     if config.use_teacher:
         print(f"\nLoading teacher: {config.teacher_name}  [{config.pretrained_tag}] ...", flush=True)
@@ -297,7 +342,7 @@ def main(config: Config) -> None:
         teacher     = t_model
         teacher_tok = open_clip.get_tokenizer(config.teacher_name)
 
-        # Probe teacher output dim — teacher is fp16, input must match
+        # Probe teacher output dim
         _dummy_img_t = torch.zeros(1, 3, 224, 224, device=device, dtype=torch.float16)
         _dummy_txt_t = _tokenize(teacher_tok, ["a"], device)
         with torch.no_grad():
@@ -306,7 +351,6 @@ def main(config: Config) -> None:
         del _dummy_img_t, _dummy_txt_t, _t_probe
         torch.cuda.empty_cache()
 
-        # Projection head uses probed dims — not config values — to avoid shape mismatch
         proj = torch.nn.Linear(s_dim, t_dim).to(device)
         print(f"  ✓ Teacher loaded  |  teacher dim={t_dim}  |  projection {s_dim}→{t_dim}", flush=True)
 
@@ -322,26 +366,67 @@ def main(config: Config) -> None:
     dataset    = ImageTextDataset(image_root, annotations, preprocess, tokenizer)
     val_size   = int(len(dataset) * config.val_split)
     train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,  num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    # Use a seeded generator for the train/val split so it is reproducible
+    split_gen = torch.Generator()
+    split_gen.manual_seed(config.seed)
+    train_ds, val_ds = random_split(dataset, [train_size, val_size], generator=split_gen)
 
-    print(f"  ✓ Total  : {len(dataset):,} samples", flush=True)
-    print(f"     Train : {train_size:,}  ({len(train_loader)} batches)", flush=True)
-    print(f"     Val   : {val_size:,}   ({len(val_loader)} batches)", flush=True)
+    # Optionally restrict training to a random subset of subset_size pairs
+    if config.subset_size is not None:
+        train_ds = build_random_subset(train_ds, config.subset_size, seed=config.seed)
+        train_size = len(train_ds)
 
-    # ── Optimiser ───────────────────────────────────────────────────────────
+    # DataLoader — shuffle=True relies on our seeded DataLoader worker init;
+    # the split + subset are already reproducible, so plain shuffle is fine here.
+    train_loader = DataLoader(
+        train_ds, batch_size=config.batch_size, shuffle=True,
+        num_workers=4, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=config.batch_size, shuffle=False,
+        num_workers=4, pin_memory=True,
+    )
+
+    print(f"  ✓ Total dataset  : {len(dataset):,} samples", flush=True)
+    print(f"     Train (after subset): {train_size:,}  ({len(train_loader)} micro-batches)", flush=True)
+    print(f"     Val              : {val_size:,}   ({len(val_loader)} micro-batches)", flush=True)
+
+    # ── Optimizer & Scheduler ───────────────────────────────────────────────
     all_params = list(student.parameters())
     if proj is not None:
         all_params += list(proj.parameters())
 
-    optimiser   = torch.optim.AdamW(all_params, lr=config.lr, weight_decay=config.weight_decay)
-    total_steps = config.epochs * len(train_loader)
-    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=total_steps)
-    scaler      = torch.amp.GradScaler("cuda", enabled=config.amp)
+    optimiser = torch.optim.AdamW(all_params, lr=config.lr, weight_decay=config.weight_decay)
 
-    print(f"\n  Total optimiser steps : {total_steps}  ({len(train_loader)} per epoch)", flush=True)
+    # Optimizer steps per epoch = ceil(micro-batches / accumulation_steps)
+    optimizer_steps_per_epoch = (len(train_loader) + accum - 1) // accum
+    total_steps  = config.epochs * optimizer_steps_per_epoch
+    warmup_steps = max(1, int(config.warmup_ratio * total_steps))
+
+    print(f"\n  Optimizer steps / epoch : {optimizer_steps_per_epoch}", flush=True)
+    print(f"  Total optimizer steps   : {total_steps}", flush=True)
+    print(f"  Warmup steps            : {warmup_steps}  ({config.warmup_ratio:.0%} of total)", flush=True)
+
+    # Linear warmup → cosine decay
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        optimiser,
+        start_factor=1e-6,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimiser,
+        T_max=max(1, total_steps - warmup_steps),
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimiser,
+        schedulers=[warmup_sched, cosine_sched],
+        milestones=[warmup_steps],
+    )
+
+    scaler = torch.amp.GradScaler("cuda", enabled=config.amp)
+
     print()
     bar()
     print("  STARTING TRAINING", flush=True)
@@ -356,10 +441,13 @@ def main(config: Config) -> None:
     # ════════════════════════════════════════════════════════════════════════
     for epoch in range(1, config.epochs + 1):
         student.train()
-        epoch_loss  = 0.0
-        epoch_start = time.time()
+        epoch_loss    = 0.0
+        epoch_start   = time.time()
         batch_times: List[float] = []
         total_batches = len(train_loader)
+
+        # Zero gradients at the start of each epoch (accumulation-aware)
+        optimiser.zero_grad()
 
         for batch_idx, (images, captions) in enumerate(train_loader):
             t0     = time.time()
@@ -368,8 +456,7 @@ def main(config: Config) -> None:
             texts_s = _tokenize(tokenizer, captions, device,
                                  context_length=getattr(student, "context_length", None))
 
-            optimiser.zero_grad()
-
+            # ── Forward pass ──────────────────────────────────────────────
             with torch.amp.autocast("cuda", enabled=config.amp):
                 img_emb, txt_emb = _features(student, images, texts_s)
                 loss = contrastive_loss(img_emb, txt_emb, config.temperature)
@@ -380,9 +467,6 @@ def main(config: Config) -> None:
                     with torch.no_grad():
                         t_img, t_txt = _features(teacher, images, texts_t)
 
-                    # Project student embeddings to teacher dim
-                    # Cast both to float32: s_*_proj may be fp16 under autocast,
-                    # and t_img/t_txt are fp16 from the teacher — mse_loss requires matching dtypes
                     s_img_proj = proj(img_emb).float()
                     s_txt_proj = proj(txt_emb).float()
                     loss += config.distill_weight * (
@@ -390,25 +474,41 @@ def main(config: Config) -> None:
                         distillation_loss(s_txt_proj, t_txt.float())
                     )
 
-            scaler.scale(loss).backward()
-            if config.clip_grad_norm > 0:
-                scaler.unscale_(optimiser)
-                torch.nn.utils.clip_grad_norm_(all_params, config.clip_grad_norm)
-            # Track scale before step to detect whether optimiser actually ran.
-            # GradScaler skips the optimiser when gradients contain inf/nan (common
-            # on the first AMP batch), which would trigger the "scheduler before
-            # optimizer" warning if scheduler.step() runs unconditionally.
-            scale_before = scaler.get_scale()
-            scaler.step(optimiser)
-            scaler.update()
-            # Only advance the LR schedule when the optimiser actually stepped
-            if scaler.get_scale() == scale_before:
-                scheduler.step()
+                # Scale loss by accumulation steps before backward so gradients
+                # are averaged over the effective batch rather than summed.
+                loss_scaled = loss / accum
 
+            # ── Backward ──────────────────────────────────────────────────
+            scaler.scale(loss_scaled).backward()
+
+            # Track unscaled loss for logging (loss.item() is the full-batch value)
             epoch_loss += loss.item()
+
+            # ── Optimizer step (every accum micro-batches or at epoch end) ─
+            is_update_step = (
+                (batch_idx + 1) % accum == 0
+                or (batch_idx + 1) == total_batches
+            )
+
+            if is_update_step:
+                if config.clip_grad_norm > 0:
+                    scaler.unscale_(optimiser)
+                    torch.nn.utils.clip_grad_norm_(all_params, config.clip_grad_norm)
+
+                # GradScaler skips the optimizer when gradients contain inf/nan
+                # (common on the first AMP micro-batch).  Only advance the LR
+                # schedule when the optimizer actually stepped.
+                scale_before = scaler.get_scale()
+                scaler.step(optimiser)
+                scaler.update()
+                if scaler.get_scale() == scale_before:
+                    scheduler.step()
+
+                optimiser.zero_grad()
+
+            # ── Batch timing & progress ───────────────────────────────────
             batch_times.append(time.time() - t0)
 
-            # ── Batch progress line ───────────────────────────────────────
             if (batch_idx + 1) % config.log_interval == 0 or (batch_idx + 1) == total_batches:
                 done     = batch_idx + 1
                 progress = done / total_batches
@@ -420,13 +520,18 @@ def main(config: Config) -> None:
                 eta    = avg_t * (total_batches - done)
                 cur_lr = optimiser.param_groups[0]["lr"]
 
+                # Show which optimizer step we are on
+                opt_step = (done + accum - 1) // accum
+                opt_total = optimizer_steps_per_epoch
+
                 print(
                     f"  Epoch [{epoch:>2}/{config.epochs}] "
                     f"[{pbar}] {progress*100:5.1f}%  "
-                    f"batch {done:>5}/{total_batches}  |  "
+                    f"batch {done:>5}/{total_batches}  "
+                    f"[opt {opt_step}/{opt_total}]  |  "
                     f"loss {loss.item():7.4f}  |  "
                     f"lr {cur_lr:.2e}  |  "
-                    f"{avg_t:.2f}s/batch  |  "
+                    f"{avg_t:.2f}s/μbatch  |  "
                     f"ETA {fmt_time(eta)}  |  "
                     f"GPU {gpu_mem()}",
                     flush=True,

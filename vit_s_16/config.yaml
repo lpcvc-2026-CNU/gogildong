@@ -3,6 +3,8 @@
 # Expected layout: DATASET.md in project root
 # Hardware target: RTX 4070 (12 GB VRAM)
 
+seed: 42                               # global random seed (Python / NumPy / PyTorch)
+
 data:
   dataset_type: coco                   # "json" | "coco" | "csv" — 실제 구조: dataset/coco/
   image_root: dataset/coco/train2017
@@ -11,6 +13,7 @@ data:
   # json: image_root: dataset/images, captions_json: dataset/captions.json
   # csv_path: dataset/data2/dataset_zip/lpcvc_300k_master_fixed.csv  # dataset_type: csv, image_root: dataset/data2/dataset_zip
   val_split: 0.05
+  subset_size: 50000                   # randomly sample this many train pairs (null = use all)
 
 model:
   student_name: ViT-S-16               # open_clip ViT-S/16 (~22M params, very mobile-friendly)
@@ -20,19 +23,19 @@ model:
   temperature: 0.05                    # slightly lower than siglip for small model
 
 training:
-  batch_size: 4                       # RTX 4070 12GB: student(22M fp32) + teacher(E-14+ fp16) fits at 16
-                                       # reduce to 8 if OOM; increase to 32 after confirming train time
-  # accumulation_steps: not applied yet — enable after checking train time per epoch
+  batch_size: 4                        # micro-batch per gradient-accumulation step
+  accumulation_steps: 8                # effective batch = batch_size × accumulation_steps = 32
+                                       # increase to 16 for effective batch 64 if GPU has headroom
   epochs: 15
   lr: 5.0e-4
   weight_decay: 0.2
-  warmup: 1000
+  warmup_ratio: 0.1                    # fraction of total optimizer steps used for linear warmup
   use_teacher: true
   distill_weight: 0.5                  # single weight for the one teacher
   clip_grad_norm: 1.0
   amp: true                            # fp16 AMP — essential with the large teacher on 12GB
   ema_decay: 0.9995
-  log_interval: 2                     # print progress every N batches
+  log_interval: 2                      # print progress every N *micro-batches*
 
 paths:
   save_dir: runs/vit_s_16
