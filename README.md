@@ -1,27 +1,55 @@
-# Proposed Model Implementations for LPCVC 2026 Track 1
+﻿# LPCVC 2026 Track 1 Baselines
 
-This directory contains three example implementations for the **LPCVC 2026 Track 1 Image‑to‑Text Retrieval** task.  Each subdirectory holds a self‑contained project that follows the conventions of the official sample solution (export, compile/profile, upload, inference) but swaps the encoders for more advanced vision‑language models described in the research summary.
+이 저장소는 LPCVC 2026 Track 1(Image-Text Retrieval)을 위한 3개 모델 실험 폴더를 포함합니다.
+각 폴더는 학습(`train.py`) -> ONNX 내보내기(`export_onnx.py`) -> AI Hub 컴파일/프로파일(`compile_and_profile.py`) -> 추론(`inference.py`) 흐름을 제공합니다.
 
-- **Track & dataset:** [LPCV 2026 Image-Text Retrieval](https://lpcv.ai/2026LPCVC/image-text-retrieval/)
-- **Dataset preparation and expected layout:** see [DATASET.md](DATASET.md).
+- 대회 링크: https://lpcv.ai/2026LPCVC/image-text-retrieval/
+- 데이터셋 준비: [DATASET.md](DATASET.md)
+- 폴더별 학습 상세 가이드: [TRAINING_GUIDE.md](TRAINING_GUIDE.md)
 
-The projects are intended as starting points.  You should review the included `README.md` files and adjust hyper‑parameters, data paths, and training settings according to your needs and the LPCVC competition rules.
+## 폴더 구성
 
-## Projects
+| 폴더 | 학생 모델 | teacher/distillation | 특징 |
+|---|---|---|---|
+| `vit_s_16` | `ViT-S-16` | `EVA02-E-14-plus` 단일 teacher (선택적) | gradient accumulation, warmup_ratio 기반 스케줄 |
+| `mobileclip2_s4_model` | `MobileCLIP2-S4` | 2개 teacher (`ViT-SO400M-14-SigLIP2`, `ViT-L-14`) | dual-teacher distillation + teacher별 projection |
+| `siglip2_model` | `siglip2_base` | `siglip2_so400m` 단일 teacher (선택적) | 가장 단순한 baseline 학습 루프 |
 
-| Directory              | Student model | Teacher model(s)       | Notes                            |
-|-----------------------|---------------|------------------------|----------------------------------|
-| `siglip2_model`       | SigLIP 2 Base (≈86 M) | SigLIP 2 SO400M (400 M) or Giant (1 B) | Uses the sigmoid based contrastive loss of SigLIP.  Fine‑tunes the student with cross‑entropy and distillation losses. |
-| `mobileclip2_s4_model` | MobileCLIP2‑S4 (~50 M) | SigLIP 2 SO400M/14 + DFN ViT‑L/14 or MetaCLIP 2 H/14 | Follows Apple’s MobileCLIP2 recipe.  Employs dual‑teacher distillation and heavy data augmentation. |
-| `eva_clip_l_model`    | EVA‑02‑CLIP‑L (≈428 M) | EVA‑02‑CLIP‑E (4.4 B) or CLIP‑ViT‑bigG‑14 | Adapts the EVA‑CLIP architecture; optionally uses a large EVA or bigG model as teacher. |
+## 빠른 시작
 
-Each subproject contains:
+### 1) 의존성 설치
 
-* **`README.md`** — explains the model choice, training procedure, and how to run the scripts.
-* **`config.yaml`** — defines hyper‑parameters such as learning rate, batch size, number of epochs, and whether to use distillation.
-* **`train.py`** — high‑level training loop using [open‑clip](https://github.com/mlfoundations/open_clip) for loading models.  The code is intentionally simple and should be extended with proper data handling and evaluation.
-* **`export_onnx.py`** — exports the trained student encoders to ONNX, following the official sample solution.
-* **`compile_and_profile.py`** — wrapper script that submits ONNX models to Qualcomm AI Hub for compilation and profiling.  You may need to install `qai_hub` and configure your token.
-* **`inference.py`** — runs the compiled models on a dataset and computes retrieval metrics such as Recall@10.
+```bash
+pip install -r requirements.txt
+```
 
-These templates do **not** download or preprocess data.  You must provide a dataset (e.g., MS‑COCO or the competition dataset) and ensure that the `image_root` and `captions_json` paths in each model’s `config.yaml` are correct.  See [DATASET.md](DATASET.md) for the expected data layout and official track/dataset links.
+### 2) 데이터 경로 설정
+
+각 폴더의 `config.yaml`에서 아래를 맞춥니다.
+
+- `data.dataset_type`: `coco` / `json` / `csv`
+- `data.image_root`
+- `data.captions_json` 또는 `data.coco_annotations` 또는 `data.csv_path`
+
+### 3) 학습 실행 예시
+
+```bash
+python vit_s_16/train.py --config vit_s_16/config.yaml
+python mobileclip2_s4_model/train.py --config mobileclip2_s4_model/config.yaml
+python siglip2_model/train.py --config siglip2_model/config.yaml
+```
+
+### 4) ONNX 내보내기 및 AI Hub 실행 예시
+
+```bash
+python vit_s_16/export_onnx.py --ckpt runs/vit_s_16/best.pt --out_dir vit_s_16/exported_onnx
+python vit_s_16/compile_and_profile.py --onnx_dir vit_s_16/exported_onnx --device "XR2 Gen 2 (Proxy)"
+python vit_s_16/inference.py --image_job <IMAGE_JOB_ID> --text_job <TEXT_JOB_ID> --dataset_id <DATASET_ID>
+```
+
+`mobileclip2_s4_model`, `siglip2_model`도 동일한 순서로 실행합니다.
+
+## 주의사항
+
+- README의 모델 설명보다 실제 동작은 각 폴더의 `config.yaml`과 `train.py`가 기준입니다.
+- 기본 학습 코드는 연구/실험용 템플릿입니다. 실제 제출용 성능 최적화(증강, DDP, 정교한 스케줄링)는 추가 구현이 필요합니다.
