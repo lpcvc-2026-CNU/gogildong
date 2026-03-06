@@ -44,7 +44,7 @@ python vit_s_16/export_onnx.py --ckpt runs/vit_s_16/best.pt --out_dir vit_s_16/e
 - AI Hub 컴파일/프로파일:
 
 ```bash
-python vit_s_16/compile_and_profile.py --onnx_dir vit_s_16/exported_onnx --device "XR2 Gen 2 (Proxy)"
+python vit_s_16/compile_and_profile.py --onnx_dir vit_s_16/exported_onnx --device "XR2 Gen 2 (Proxy)" --target_runtime qnn_context_binary
 ```
 
 - 추론:

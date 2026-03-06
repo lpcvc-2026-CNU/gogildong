@@ -23,7 +23,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
 import qai_hub as hub
 
 
@@ -36,6 +35,7 @@ def _compile(
     device: hub.Device,
     label: str,
     input_specs: dict,
+    target_runtime: str,
 ) -> tuple:
     """Submit compile job with static input_specs, wait, return (model, job_id)."""
     print(f"  Uploading {onnx_path.name} → {device.name} ...")
@@ -45,6 +45,7 @@ def _compile(
         model=onnx_path,
         device=device,
         input_specs=input_specs,   # ← fixes "dynamic shapes" error
+        options=f"--target_runtime {target_runtime}",
     )
     print(f"  {label} compile job ID : {job.job_id}  (waiting…)")
     job.wait()
@@ -82,6 +83,7 @@ def compile_and_profile(
     skip_profile: bool,
     image_size: int,
     context_length: int,
+    target_runtime: str,
 ) -> None:
     onnx_dir   = Path(onnx_dir)
     image_path = onnx_dir / img_name
@@ -107,13 +109,17 @@ def compile_and_profile(
 
     # ── Image encoder ─────────────────────────────────────────────────────────
     print("\n[1/2] Image encoder")
-    compiled_image, img_job_id = _compile(image_path, device, "Image", img_specs)
+    compiled_image, img_job_id = _compile(
+        image_path, device, "Image", img_specs, target_runtime
+    )
     if not skip_profile:
         _profile(compiled_image, device, "Image")
 
     # ── Text encoder ──────────────────────────────────────────────────────────
     print("\n[2/2] Text encoder")
-    compiled_text, txt_job_id = _compile(text_path, device, "Text", txt_specs)
+    compiled_text, txt_job_id = _compile(
+        text_path, device, "Text", txt_specs, target_runtime
+    )
     if not skip_profile:
         _profile(compiled_text, device, "Text")
 
@@ -148,9 +154,18 @@ if __name__ == "__main__":
                         help="Image resolution (default: 224)")
     parser.add_argument("--context_length", type=int, default=77,
                         help="Token sequence length (default: 77, open_clip ViT-S-16)")
+    parser.add_argument(
+        "--target_runtime",
+        default="qnn_context_binary",
+        help=(
+            "QAI Hub target runtime passed to compile options "
+            "(default: qnn_context_binary)"
+        ),
+    )
     args = parser.parse_args()
     compile_and_profile(
         args.onnx_dir, args.img_name, args.txt_name,
         args.device, args.skip_profile,
         args.image_size, args.context_length,
+        args.target_runtime,
     )
