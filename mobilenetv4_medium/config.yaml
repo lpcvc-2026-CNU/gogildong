@@ -1,8 +1,7 @@
 # =============================================================================
-# LPCVC 2026 Track 1 - Central Configuration
+# LPCVC 2026 Track 1 — Central Configuration
+# 모든 하이퍼파라미터와 경로를 이 파일 하나에서 관리합니다.
 # =============================================================================
-# 모든 하이퍼파라미터, 경로, 학습 설정을 이 파일 하나에서 관리합니다.
-# config.py (dataclass) 를 완전히 대체합니다.
 
 # -----------------------------------------------------------------------------
 # 모델 구조
@@ -10,33 +9,34 @@
 model:
   # 학생 이미지 인코더 (timm)
   student_image_backbone: "mobilenetv4_conv_small"
-  student_image_input_size: 224        # 대회 고정 규격 (변경 금지)
-  student_image_output_dim: 960        # MobileNetV4-Small GAP 출력 차원
+  student_image_input_size: 224          # 대회 고정 규격 — 절대 변경 금지
 
-  # 학생 텍스트 인코더
+  # 학생 텍스트 인코더 (DistilBERT 아키텍처 + CLIP vocab)
   student_text_backbone: "distilbert-base-uncased"
-  student_text_output_dim: 768         # DistilBERT hidden dim
 
-  # 공유 임베딩 차원 (두 인코더의 공통 출력 공간)
+  # ─── 토크나이저 (대회 규격 고정) ───────────────────────────────────────────
+  # 대회 평가 입력: openai/clip-vit-base-patch32 tokenizer, max_length=77
+  # TextEncoder 의 word_embeddings 를 CLIP vocab(49408)으로 교체하여 호환성 확보.
+  clip_tokenizer_name: "openai/clip-vit-base-patch32"  # dataset.py 에서 사용
+  max_text_length: 77                                   # 대회 고정 — 절대 변경 금지
+  clip_vocab_size: 49408                                # student.py 에서 사용
+
+  # 공유 임베딩 차원 (이미지·텍스트 인코더 공통 출력)
   embed_dim: 512
 
-  # Head_Sig: SigLIP2 공간 투영 헤드
+  # Head_Sig: student embed → SigLIP2 공간 투영
   siglip_teacher_dim: 1152             # SigLIP2-SO400M 임베딩 차원
   proj_sig_hidden_dim: 1024
 
-  # Head_DFN: DFN 공간 투영 헤드
+  # Head_DFN: student embed → DFN 공간 투영
   dfn_teacher_dim: 1024                # DFN ViT-H-14 임베딩 차원
   proj_dfn_hidden_dim: 1024
 
-  # 스승 모델 식별자 (학습 시에만 사용, 추론/제출 시 불필요)
+  # 스승 모델 식별자 (학습 시에만 사용, 제출에는 불필요)
   siglip2_model_name: "google/siglip2-so400m-patch14-384"
   siglip2_input_size: 384
   dfn_model_name: "apple/DFN5B-CLIP-ViT-H-14-378"
   dfn_input_size: 378
-
-  # 텍스트 토크나이저 (대회 규격 고정 - 변경 금지)
-  tokenizer_name: "openai/clip-vit-base-patch32"
-  max_text_length: 77
 
 # -----------------------------------------------------------------------------
 # 학습 일반 설정
@@ -48,47 +48,57 @@ training:
   output_dir: "checkpoints"
   log_dir: "logs"
 
-  # 대조 학습 온도 (learnable_temperature=True 이면 초기값으로만 사용)
-  temperature: 0.07
-  learnable_temperature: true
-
-  # KL 증류 소프트 레이블 온도 (클수록 부드러운 분포)
-  kl_temperature: 4.0
-
-  # 그래디언트 클리핑
+  temperature: 0.07       # logit_scale 초기값 (학습 가능)
+  kl_temperature: 4.0     # KL soft-label 온도 (클수록 부드러운 분포)
   max_grad_norm: 1.0
 
   # -------------------------------------------------------------------
-  # Stage 1: DFN Warm-up (이미지 인코더 사전학습)
+  # Stage 1: DFN Warm-up
+  # 목표: 고품질 DFN 특징으로 이미지 인코더 초기화
+  # 전략:
+  #   - 텍스트 인코더 동결 (freeze_text: true)
+  #   - L_MSE(DFN 이미지) 위주, L_CLIP 보조
+  #   - SigLIP2/KL 비활성 (λ2_sig=0, λ3=0)
   # -------------------------------------------------------------------
   stage1:
     epochs: 10
     lr: 1.0e-4
     weight_decay: 1.0e-4
     warmup_steps: 500
-    freeze_text: true           # DistilBERT 동결
-    lambda1: 0.2                # L_CLIP 가중치
-    lambda2: 0.8                # L_MSE(DFN) 가중치
-    lambda3: 0.0                # L_KL 비활성
+    freeze_text: true
+    lambda1: 0.1          # L_CLIP (보조)
+    lambda2_dfn: 0.9      # L_MSE(DFN) — 이미지 특징 모방 주도
+    lambda2_sig: 0.0      # L_cosine(SigLIP2) — Stage 1 비활성
+    lambda3: 0.0          # L_KL — Stage 1 비활성
 
   # -------------------------------------------------------------------
-  # Stage 2: Dual Teacher KD (관계 증류 메인 학습)
+  # Stage 2: Dual Teacher KD
+  # 목표: 두 스승의 관계 지식 흡수
+  # 전략:
+  #   - 텍스트 인코더 해제 (freeze_text: false)
+  #   - 동적 λ: λ2_dfn↓, λ2_sig↓, λ3↑ (에폭 선형 보간)
+  #   - 초반은 특징 모방(MSE) 중심, 후반은 분포 증류(KL) 중심
   # -------------------------------------------------------------------
   stage2:
     epochs: 30
     lr: 5.0e-5
     weight_decay: 1.0e-4
     warmup_steps: 1000
-    freeze_text: false          # DistilBERT 해제
-    lambda1: 0.3                # L_CLIP (고정)
-    # λ2, λ3 는 에폭에 따라 선형 보간 (Dynamic Weighting)
-    lambda2_start: 0.5          # 초반: DFN MSE 높게
-    lambda2_end: 0.1            # 후반: DFN MSE 낮게
-    lambda3_start: 0.2          # 초반: KL 낮게
-    lambda3_end: 0.6            # 후반: KL 높게
+    freeze_text: false
+    lambda1: 0.3              # L_CLIP (고정)
+    lambda2_dfn_start: 0.35   # 초반: DFN MSE 높게
+    lambda2_dfn_end: 0.07     # 후반: DFN MSE 낮게
+    lambda2_sig_start: 0.15   # 초반: SigLIP2 cosine 보조
+    lambda2_sig_end: 0.03     # 후반: SigLIP2 cosine 최소
+    lambda3_start: 0.2        # 초반: KL 낮게
+    lambda3_end: 0.6          # 후반: KL 높게 — Recall@10 핵심
 
   # -------------------------------------------------------------------
-  # Stage 3: QAT Fine-tuning (양자화 보정)
+  # Stage 3: QAT Fine-tuning
+  # 목표: INT8 양자화 보정, Recall@10 유지
+  # 전략:
+  #   - L_CLIP 비중 상향, 증류 강도 하향
+  #   - QAT 적용 범위는 아래 플래그로 제어
   # -------------------------------------------------------------------
   stage3:
     epochs: 5
@@ -96,9 +106,13 @@ training:
     weight_decay: 1.0e-4
     warmup_steps: 200
     freeze_text: false
-    lambda1: 0.7                # L_CLIP 비중 상향
-    lambda2: 0.1
+    lambda1: 0.7
+    lambda2_dfn: 0.08
+    lambda2_sig: 0.02
     lambda3: 0.2
+    # QAT 적용 범위 (trainer.py 가 이 플래그를 읽습니다)
+    qat_image_encoder: true
+    qat_text_encoder: false   # DistilBERT QAT는 복잡—필요 시 활성화
 
 # -----------------------------------------------------------------------------
 # 데이터 설정
@@ -106,15 +120,11 @@ training:
 data:
   train_path: "data/train"
   val_path: "data/val"
-  # 스승 모델이 볼 이미지 해상도 (SigLIP2 용)
-  teacher_image_size: 384
-  # ImageNet 정규화 (학생 모델용)
-  image_mean: [0.485, 0.456, 0.406]
-  image_std: [0.229, 0.224, 0.225]
-  # SigLIP2 / DFN 정규화 (스승 모델용)
-  teacher_mean: [0.5, 0.5, 0.5]
-  teacher_std: [0.5, 0.5, 0.5]
-  # 데이터 증강 강도
+  teacher_image_size: 384      # SigLIP2 스승 입력 해상도
+  image_mean: [0.485, 0.456, 0.406]   # ImageNet 정규화 (학생)
+  image_std:  [0.229, 0.224, 0.225]
+  teacher_mean: [0.5, 0.5, 0.5]      # SigLIP2/DFN 정규화 (스승)
+  teacher_std:  [0.5, 0.5, 0.5]
   augmentation:
     random_crop_scale_min: 0.8
     random_crop_scale_max: 1.0
@@ -124,19 +134,17 @@ data:
     color_jitter_hue: 0.05
 
 # -----------------------------------------------------------------------------
-# ONNX 내보내기 및 Qualcomm AI Hub 제출 설정
+# ONNX 내보내기 및 Qualcomm AI Hub 제출
 # -----------------------------------------------------------------------------
 export:
   output_dir: "export"
   onnx_opset: 17
-  # Qualcomm AI Hub 설정
   qai_hub:
-    device: "Snapdragon 8 Elite QRD"   # 대회 평가 타겟 디바이스
-    target_runtime: "onnx"             # ONNX Runtime (QNN EP)
-    compile_options: ""                # 추가 컴파일 옵션 (필요시)
-    quantize_weights: "int8"           # 가중치 양자화 타입 (int8 / fp16 / "")
-    quantize_activations: "int8"       # 활성화 양자화 타입
-    calibration_samples: 512          # 양자화 보정 샘플 수
-  # 모델 이름 (AI Hub 제출 시 표시)
+    device: "Qualcomm XR2 Gen 2"
+    target_runtime: "onnx"
+    compile_options: ""
+    quantize_weights: "int8"
+    quantize_activations: "int8"
+    calibration_samples: 512
   image_model_name: "LPCVC26_T1_ImageEncoder"
   text_model_name: "LPCVC26_T1_TextEncoder"

@@ -1,13 +1,15 @@
 """
 Student CLIP model for LPCVC 2026 Track 1.
 
-Image Encoder : MobileNetV4-Small  (224x224 입력, GAP -> embed_dim)
-Text Encoder  : DistilBERT-Base    (CLS 토큰 -> embed_dim)
-Projection    : DualProjectionHeads (shared embed -> SigLIP2 공간 & DFN 공간)
-
-모든 차원/모델명은 cfg(ConfigNode) 에서 읽습니다.
+[ 토크나이저 정책 - 중요 ]
+대회 평가 규격: openai/clip-vit-base-patch32 로 tokenize 한 (1×77) 정수 텐서 입력.
+DistilBERT 기본 vocab(30522)은 이 토큰 ID를 수용하지 못함.
+→ TextEncoder 초기화 시 word_embeddings 레이어를 CLIP vocab 크기(49408)로 교체.
+  나머지 DistilBERT 가중치(Attention, FFN)는 사전학습 값 유지.
+  교체된 embedding만 학습 중 랜덤 초기화 후 fine-tune.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,10 +26,10 @@ from utils.config import ConfigNode
 
 class ImageEncoder(nn.Module):
     """
-    MobileNetV4-Small backbone + Linear projection → shared embed_dim.
+    MobileNetV4-Small + Linear → shared embed_dim.
 
-    Input : (B, 3, student_image_input_size, student_image_input_size)
-    Output: (B, embed_dim)  – unnormalized
+    Input : (B, 3, 224, 224)
+    Output: (B, embed_dim)  unnormalized
     """
 
     def __init__(self, cfg: ConfigNode, pretrained: bool = True):
@@ -38,14 +40,11 @@ class ImageEncoder(nn.Module):
             num_classes=0,
             global_pool="avg",
         )
-        backbone_out_dim = self.backbone.num_features
-        self.proj = nn.Linear(backbone_out_dim, cfg.model.embed_dim, bias=False)
+        self.proj = nn.Linear(self.backbone.num_features, cfg.model.embed_dim, bias=False)
         self.norm = nn.LayerNorm(cfg.model.embed_dim)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        features   = self.backbone(pixel_values)
-        embeddings = self.norm(self.proj(features))
-        return embeddings
+        return self.norm(self.proj(self.backbone(pixel_values)))
 
 
 # ---------------------------------------------------------------------------
@@ -54,24 +53,38 @@ class ImageEncoder(nn.Module):
 
 class TextEncoder(nn.Module):
     """
-    DistilBERT-Base + Linear projection → shared embed_dim.
+    DistilBERT-Base + Linear → shared embed_dim.
 
-    Input : input_ids (B, max_text_length), attention_mask (B, max_text_length)
-    Output: (B, embed_dim) – unnormalized
+    대회 규격 대응:
+      - CLIP tokenizer(vocab=49408) 출력 token ID 를 입력으로 받음.
+      - DistilBERT 의 word_embeddings 를 Embedding(49408, 768) 로 교체.
+      - 나머지 DistilBERT 가중치(Transformer layers)는 사전학습 값 유지.
+
+    Input : input_ids (B, 77), attention_mask (B, 77)
+    Output: (B, embed_dim)  unnormalized
     """
 
     def __init__(self, cfg: ConfigNode, pretrained: bool = True):
         super().__init__()
         if pretrained:
-            self.distilbert = DistilBertModel.from_pretrained(
-                cfg.model.student_text_backbone
-            )
+            self.distilbert = DistilBertModel.from_pretrained(cfg.model.student_text_backbone)
         else:
             self.distilbert = DistilBertModel(DistilBertConfig())
 
-        hidden_dim = self.distilbert.config.hidden_size
-        self.proj  = nn.Linear(hidden_dim, cfg.model.embed_dim, bias=False)
-        self.norm  = nn.LayerNorm(cfg.model.embed_dim)
+        hidden_dim = self.distilbert.config.hidden_size  # 768
+
+        # CLIP vocab 크기로 word embedding 교체
+        # DistilBERT position/layer norm 등은 token ID 독립적이므로 그대로 사용 가능
+        clip_vocab_size = cfg.model.clip_vocab_size  # 49408
+        if self.distilbert.config.vocab_size != clip_vocab_size:
+            self.distilbert.embeddings.word_embeddings = nn.Embedding(
+                clip_vocab_size, hidden_dim, padding_idx=1  # CLIP pad_token_id=1
+            )
+            # Xavier 초기화 (랜덤 초기화보다 안정적)
+            nn.init.xavier_uniform_(self.distilbert.embeddings.word_embeddings.weight)
+
+        self.proj = nn.Linear(hidden_dim, cfg.model.embed_dim, bias=False)
+        self.norm = nn.LayerNorm(cfg.model.embed_dim)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         outputs    = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
@@ -79,12 +92,14 @@ class TextEncoder(nn.Module):
         return self.norm(self.proj(cls_output))
 
     def freeze(self):
-        for param in self.distilbert.parameters():
-            param.requires_grad = False
+        """DistilBERT 가중치 동결 (Stage 1 용)."""
+        for p in self.distilbert.parameters():
+            p.requires_grad = False
 
     def unfreeze(self):
-        for param in self.distilbert.parameters():
-            param.requires_grad = True
+        """DistilBERT 가중치 해제 (Stage 2+ 용)."""
+        for p in self.distilbert.parameters():
+            p.requires_grad = True
 
 
 # ---------------------------------------------------------------------------
@@ -93,33 +108,35 @@ class TextEncoder(nn.Module):
 
 class StudentCLIP(nn.Module):
     """
-    이미지-텍스트 대조 학습 + 이중 스승 지식 증류 학생 모델.
+    Full student model: ImageEncoder + TextEncoder + DualProjectionHeads.
 
-    학습 시: shared embed + projection heads (KD용) 모두 반환
-    추론 시: L2-normalized shared embed 만 반환 (Recall@10 계산용)
+    Projection heads 역할:
+      head_sig : student embed → SigLIP2 공간  (KL 증류 + MSE feature mimicking)
+      head_dfn : student embed → DFN 공간      (KL 증류 + MSE feature mimicking)
+
+    추론 시에는 shared L2-normalized embed 만 사용.
+    Projection head 는 학습 시에만 활성화.
     """
 
     def __init__(self, cfg: ConfigNode):
         super().__init__()
         self.cfg = cfg
 
-        self.image_encoder = ImageEncoder(cfg)
-        self.text_encoder  = TextEncoder(cfg)
-
+        self.image_encoder    = ImageEncoder(cfg)
+        self.text_encoder     = TextEncoder(cfg)
         self.image_proj_heads = DualProjectionHeads(cfg)
         self.text_proj_heads  = DualProjectionHeads(cfg)
 
-        # 학습 가능한 온도 파라미터 (초기값: ln(1/0.07) ≈ 2.659)
-        import math
+        # 학습 가능한 온도 (초기값: -ln(temperature))
         init_val = -math.log(cfg.training.temperature)
         self.logit_scale = nn.Parameter(torch.ones([]) * init_val)
 
     def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """L2-normalized 이미지 임베딩 반환 (추론용)."""
+        """L2-normalized 이미지 임베딩 (추론용)."""
         return F.normalize(self.image_encoder(pixel_values), dim=-1)
 
     def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """L2-normalized 텍스트 임베딩 반환 (추론용)."""
+        """L2-normalized 텍스트 임베딩 (추론용)."""
         return F.normalize(self.text_encoder(input_ids, attention_mask), dim=-1)
 
     def forward(
@@ -129,11 +146,17 @@ class StudentCLIP(nn.Module):
         attention_mask: torch.Tensor,
         return_projections: bool = True,
     ):
-        image_feats = self.image_encoder(pixel_values)
-        text_feats  = self.text_encoder(input_ids, attention_mask)
+        """
+        Returns:
+            return_projections=False : (image_embeds, text_embeds, logit_scale)
+            return_projections=True  : 위 3개 + (img_proj_sig, img_proj_dfn,
+                                                    txt_proj_sig, txt_proj_dfn)
+        """
+        image_feats  = self.image_encoder(pixel_values)
+        text_feats   = self.text_encoder(input_ids, attention_mask)
 
         image_embeds = F.normalize(image_feats, dim=-1)
-        text_embeds  = F.normalize(text_feats, dim=-1)
+        text_embeds  = F.normalize(text_feats,  dim=-1)
         logit_scale  = self.logit_scale.exp()
 
         if not return_projections:

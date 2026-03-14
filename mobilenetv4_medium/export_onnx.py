@@ -7,7 +7,7 @@ LPCVC 2026 Track 1 — ONNX 내보내기 및 Qualcomm AI Hub 제출 스크립트
 전체 워크플로우:
   1. 학습된 PyTorch 모델 로드
   2. 이미지/텍스트 인코더를 분리하여 ONNX 내보내기
-  3. qai_hub.submit_compile_job() 으로 각 모델 컴파일 (Snapdragon 8 Elite)
+  3. qai_hub.submit_compile_job() 으로 각 모델 컴파일 (Qualcomm XR2 Gen 2)
   4. 컴파일 완료 대기 및 결과 확인
   5. (선택) 양자화: qai_hub.submit_quantize_job()
   6. (선택) 프로파일링: qai_hub.submit_profile_job() 으로 지연시간 측정
