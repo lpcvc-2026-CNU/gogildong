@@ -2,16 +2,16 @@
 Evaluation script for LPCVC 2026 Track 1.
 
 Usage:
-    python evaluate.py --checkpoint checkpoints/stage3_epoch005.pt --val_data data/val
+    python evaluate.py --checkpoint checkpoints/stage3_epoch005.pt
 """
 
 import argparse
 import logging
 import torch
 
-from utils.config import get_default_config
+from utils.config import load_config        # ← get_default_config() 제거
 from models.student import build_student_model
-from data.dataset import CLIPTextTokenizer, build_dataloader
+from data.dataset import StudentTokenizer, build_dataloader
 from utils.metrics import evaluate_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -21,34 +21,37 @@ logger = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate LPCVC 2026 Track 1 model")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--val_data", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--config",     type=str, default="config.yaml")
+    parser.add_argument("--val_data",   type=str, default=None,
+                        help="검증 데이터 경로 (미지정 시 config.data.val_path 사용)")
+    parser.add_argument("--device",     type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    cfg = get_default_config()
+    cfg  = load_config(args.config)
 
-    # Load model
-    model = build_student_model(cfg.model).to(args.device)
+    # 모델 로드
+    model = build_student_model(cfg).to(args.device)
     state = torch.load(args.checkpoint, map_location=args.device)
     model.load_state_dict(state["model_state_dict"])
+    model.eval()
     logger.info(f"Loaded checkpoint: {args.checkpoint}")
 
-    # Build dataloader
-    tokenizer = CLIPTextTokenizer(cfg.model.tokenizer_name)
+    # DataLoader
+    tokenizer = StudentTokenizer(cfg)
+    val_path  = args.val_data or cfg.data.val_path
     val_loader = build_dataloader(
-        data_path=args.val_data,
+        data_path=val_path,
         tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        num_workers=4,
+        cfg=cfg,
         is_train=False,
         use_teacher_transforms=False,
     )
 
-    # Evaluate
+    # 평가
     metrics = evaluate_model(model, val_loader, device=args.device)
 
     print("\n" + "="*50)

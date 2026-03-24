@@ -1,12 +1,12 @@
 """
-Main training script for LPCVC 2026 Track 1.
+Main training script for LPCVC 2026 Track 1 (Single Teacher: SigLIP2).
 
 Usage:
     python train.py                                          # 전체 3단계
     python train.py --stage 1                               # Stage 1만
     python train.py --stage 2 --resume checkpoints/stage1_epoch010.pt
     python train.py --stage 3 --resume checkpoints/stage2_epoch030.pt
-    python train.py --config my_config.yaml --stage all    # 커스텀 설정 파일
+    python train.py --config my_config.yaml --stage all
 """
 
 import argparse
@@ -20,7 +20,7 @@ import torch
 from utils.config import load_config, save_config
 from models.student import build_student_model
 from models.teacher import TeacherManager
-from data.dataset import CLIPTextTokenizer, build_dataloader
+from data.dataset import StudentTokenizer, build_dataloader
 from training.trainer import Stage1Trainer, Stage2Trainer, Stage3Trainer
 from utils.metrics import evaluate_model
 
@@ -41,38 +41,42 @@ def set_seed(seed: int):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LPCVC 2026 Track 1 Training")
-    parser.add_argument("--config", type=str, default="config.yaml", help="YAML 설정 파일 경로")
-    parser.add_argument("--stage", type=str, default="all", choices=["1", "2", "3", "all"])
-    parser.add_argument("--resume", type=str, default=None, help="이어서 학습할 체크포인트 경로")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--no_teachers", action="store_true", help="스승 모델 없이 실행 (디버깅용)")
-    parser.add_argument("--max_samples", type=int, default=None, help="데이터셋 샘플 수 제한 (디버깅용)")
+    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--stage", type=str, default="all",
+                        choices=["1", "2", "3", "all"])
+    parser.add_argument("--resume", type=str, default=None,
+                        help="이어서 학습할 체크포인트 경로")
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--no_teacher", action="store_true",
+                        help="스승 모델 없이 실행 (디버깅용)")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="데이터셋 샘플 수 제한 (디버깅용)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    cfg  = load_config(args.config)
+    cfg  = load_config(args.config)   # ← get_default_config() 대신 load_config()
 
     set_seed(cfg.training.seed)
     device = args.device
     logger.info(f"디바이스: {device}  |  설정 파일: {args.config}")
 
-    # 학습 재현을 위해 사용된 config 복사 저장
     os.makedirs(cfg.training.output_dir, exist_ok=True)
     save_config(cfg, os.path.join(cfg.training.output_dir, "used_config.yaml"))
 
     # --- 토크나이저 ---
-    tokenizer = CLIPTextTokenizer(cfg)
+    tokenizer = StudentTokenizer(cfg)   # ← CLIPTextTokenizer 대신 StudentTokenizer
 
     # --- DataLoader ---
-    use_teachers = not args.no_teachers
+    use_teacher = not args.no_teacher
     train_loader = build_dataloader(
         data_path=cfg.data.train_path,
         tokenizer=tokenizer,
         cfg=cfg,
         is_train=True,
-        use_teacher_transforms=use_teachers,
+        use_teacher_transforms=use_teacher,
         max_samples=args.max_samples,
     )
 
@@ -92,17 +96,12 @@ def main():
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"학생 모델 파라미터 수: {total_params:,}")
 
-    # --- 스승 모델 ---
+    # --- SigLIP2 스승 모델 ---
     teacher_manager = None
-    if use_teachers:
-        logger.info("스승 모델 로드 중 (시간이 걸릴 수 있습니다)...")
+    if use_teacher:
+        logger.info("SigLIP2 스승 모델 로드 중...")
         try:
-            teacher_manager = TeacherManager(
-                cfg=cfg,
-                device=device,
-                load_siglip=(args.stage in ["all", "2", "3"]),
-                load_dfn=True,
-            )
+            teacher_manager = TeacherManager(cfg=cfg, device=device)
         except Exception as e:
             logger.warning(f"스승 모델 로드 실패: {e}")
             logger.warning("스승 없이 학습을 진행합니다.")
@@ -117,12 +116,16 @@ def main():
         if stage_num == 1:
             trainer = Stage1Trainer(model, teacher_manager, cfg, device)
             trainer.run(train_loader, resume_from=resume_path)
-            resume_path = str(trainer.output_dir / f"stage1_epoch{cfg.training.stage1.epochs:03d}.pt")
+            resume_path = str(
+                trainer.output_dir / f"stage1_epoch{cfg.training.stage1.epochs:03d}.pt"
+            )
 
         elif stage_num == 2:
             trainer = Stage2Trainer(model, teacher_manager, cfg, device)
             trainer.run(train_loader, resume_from=resume_path)
-            resume_path = str(trainer.output_dir / f"stage2_epoch{cfg.training.stage2.epochs:03d}.pt")
+            resume_path = str(
+                trainer.output_dir / f"stage2_epoch{cfg.training.stage2.epochs:03d}.pt"
+            )
 
         elif stage_num == 3:
             trainer = Stage3Trainer(model, teacher_manager, cfg, device)

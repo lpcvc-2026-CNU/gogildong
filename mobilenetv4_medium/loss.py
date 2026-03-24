@@ -1,11 +1,11 @@
 """
-Loss functions for LPCVC 2026 Track 1 dual distillation training.
+Loss functions for LPCVC 2026 Track 1 (Single Teacher: SigLIP2).
 
-L_total = λ1 * L_CLIP + λ2 * L_MSE(feat_DFN) + λ3 * L_KL(dist_SigLIP2 + dist_DFN)
+L_total = λ1 * L_CLIP + λ2 * L_MSE(proj_sig, sig_embeds) + λ3 * L_KL(sig)
 
-- L_CLIP  : Standard symmetric contrastive (InfoNCE) loss for student.
-- L_MSE   : Feature mimicking loss – student projections match DFN embeddings.
-- L_KL    : Soft label distillation – student similarity matches teacher's.
+- L_CLIP : Symmetric InfoNCE — student 자체 대조 학습
+- L_MSE  : Feature mimicking — student projection → SigLIP2 공간 MSE
+- L_KL   : Soft label distillation — student 유사도 분포가 SigLIP2를 따르도록
 """
 
 import torch
@@ -15,7 +15,7 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# L_CLIP: Symmetric InfoNCE (Contrastive) Loss
+# L_CLIP: Symmetric InfoNCE
 # ---------------------------------------------------------------------------
 
 def clip_contrastive_loss(
@@ -24,30 +24,22 @@ def clip_contrastive_loss(
     logit_scale: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Symmetric InfoNCE loss (identical to original CLIP).
-
     Args:
-        image_embeds: (B, D) – L2-normalized
-        text_embeds:  (B, D) – L2-normalized
-        logit_scale:  scalar – exp(learnable log temperature)
-
-    Returns:
-        Scalar loss.
+        image_embeds: (B, D) — L2-normalized
+        text_embeds:  (B, D) — L2-normalized
+        logit_scale:  scalar — exp(learnable log temperature)
     """
-    batch_size = image_embeds.shape[0]
-    labels = torch.arange(batch_size, device=image_embeds.device)
+    B      = image_embeds.shape[0]
+    labels = torch.arange(B, device=image_embeds.device)
 
-    logits_i2t = logit_scale * image_embeds @ text_embeds.T   # (B, B)
-    logits_t2i = logits_i2t.T
-
-    loss_i2t = F.cross_entropy(logits_i2t, labels)
-    loss_t2i = F.cross_entropy(logits_t2i, labels)
-
-    return (loss_i2t + loss_t2i) / 2.0
+    logits_i2t = logit_scale * image_embeds @ text_embeds.T
+    loss = (F.cross_entropy(logits_i2t, labels) +
+            F.cross_entropy(logits_i2t.T, labels)) / 2.0
+    return loss
 
 
 # ---------------------------------------------------------------------------
-# L_MSE: Feature Mimicking Loss (DFN warm-up)
+# L_MSE: Feature Mimicking
 # ---------------------------------------------------------------------------
 
 def feature_mimicking_loss(
@@ -55,15 +47,11 @@ def feature_mimicking_loss(
     teacher_embeds: torch.Tensor,
 ) -> torch.Tensor:
     """
-    MSE loss between student projected embeddings and teacher embeddings.
-    Both inputs are L2-normalized before MSE computation.
+    MSE between L2-normalized student projection and (already normalized) teacher embeds.
 
     Args:
-        student_proj:  (B, D_teacher) – student projection into teacher space
-        teacher_embeds: (B, D_teacher) – teacher embeddings (already normalized)
-
-    Returns:
-        Scalar MSE loss.
+        student_proj:  (B, D_teacher) — raw projection output
+        teacher_embeds: (B, D_teacher) — L2-normalized teacher embeddings
     """
     student_norm = F.normalize(student_proj, dim=-1)
     return F.mse_loss(student_norm, teacher_embeds.detach())
@@ -73,122 +61,67 @@ def feature_mimicking_loss(
 # L_KL: Soft Label Distribution Distillation
 # ---------------------------------------------------------------------------
 
-def compute_similarity_distribution(
+def _sim_distribution(
     image_embeds: torch.Tensor,
     text_embeds: torch.Tensor,
-    temperature: float = 4.0,
-) -> tuple:
-    """
-    Compute i2t and t2i softmax distributions over similarity logits.
-
-    Args:
-        image_embeds: (B, D) – normalized
-        text_embeds:  (B, D) – normalized
-        temperature:  Scaling temperature (higher = softer distribution)
-
-    Returns:
-        dist_i2t: (B, B)
-        dist_t2i: (B, B)
-    """
-    logits = (image_embeds @ text_embeds.T) / temperature
-    dist_i2t = torch.softmax(logits, dim=-1)
+    temperature: float,
+):
+    """Return softmax i2t and t2i similarity distributions."""
+    logits   = (image_embeds @ text_embeds.T) / temperature
+    dist_i2t = torch.softmax(logits,   dim=-1)
     dist_t2i = torch.softmax(logits.T, dim=-1)
     return dist_i2t, dist_t2i
 
 
 def kl_distillation_loss(
-    student_i2t: torch.Tensor,
-    student_t2i: torch.Tensor,
-    teacher_i2t: torch.Tensor,
-    teacher_t2i: torch.Tensor,
+    student_image_embeds: torch.Tensor,
+    student_text_embeds: torch.Tensor,
+    teacher_image_embeds: torch.Tensor,
+    teacher_text_embeds: torch.Tensor,
+    logit_scale: torch.Tensor,
+    kl_temperature: float = 4.0,
 ) -> torch.Tensor:
     """
-    KL divergence loss between student and teacher similarity distributions.
-    KL(teacher || student)  — student learns to match teacher's distribution.
+    KL(teacher_dist || student_dist) — symmetric across i2t and t2i.
 
-    Args:
-        student_i2t:  (B, B) student image→text softmax distribution
-        student_t2i:  (B, B) student text→image softmax distribution
-        teacher_i2t:  (B, B) teacher image→text softmax distribution (target)
-        teacher_t2i:  (B, B) teacher text→image softmax distribution (target)
-
-    Returns:
-        Scalar KL loss.
+    Student temperature is derived from logit_scale so it remains consistent
+    with the contrastive loss.
     """
-    # KL(P || Q) = sum(P * log(P/Q))
-    # F.kl_div expects log-probabilities as input, probabilities as target
+    student_temp = kl_temperature / logit_scale.detach().clamp(min=1e-4)
+
+    stu_i2t, stu_t2i = _sim_distribution(
+        student_image_embeds, student_text_embeds, temperature=student_temp
+    )
+    tch_i2t, tch_t2i = _sim_distribution(
+        teacher_image_embeds, teacher_text_embeds, temperature=kl_temperature
+    )
+
     kl_i2t = F.kl_div(
-        torch.log(student_i2t + 1e-8),
-        teacher_i2t.detach(),
+        torch.log(stu_i2t + 1e-8),
+        tch_i2t.detach(),
         reduction="batchmean",
     )
     kl_t2i = F.kl_div(
-        torch.log(student_t2i + 1e-8),
-        teacher_t2i.detach(),
+        torch.log(stu_t2i + 1e-8),
+        tch_t2i.detach(),
         reduction="batchmean",
     )
     return (kl_i2t + kl_t2i) / 2.0
 
 
-def dual_teacher_kl_loss(
-    student_image_embeds: torch.Tensor,
-    student_text_embeds: torch.Tensor,
-    siglip_image_embeds: torch.Tensor,
-    siglip_text_embeds: torch.Tensor,
-    dfn_image_embeds: torch.Tensor,
-    dfn_text_embeds: torch.Tensor,
-    logit_scale: torch.Tensor,
-    kl_temperature: float = 4.0,
-) -> torch.Tensor:
-    """
-    Combined KL distillation from both teachers.
-    Student learns the average similarity distribution of SigLIP2 and DFN.
-
-    Args:
-        student_image_embeds: (B, D_student) – normalized
-        student_text_embeds:  (B, D_student) – normalized
-        siglip_image_embeds:  (B, D_sig)     – normalized
-        siglip_text_embeds:   (B, D_sig)     – normalized
-        dfn_image_embeds:     (B, D_dfn)     – normalized
-        dfn_text_embeds:      (B, D_dfn)     – normalized
-        logit_scale:          scalar
-        kl_temperature:       Temperature for teacher distributions
-
-    Returns:
-        Scalar combined KL loss.
-    """
-    # --- Student distributions (using student's own logit scale) ---
-    student_temp = kl_temperature / logit_scale.detach()
-    stu_i2t, stu_t2i = compute_similarity_distribution(
-        student_image_embeds, student_text_embeds, temperature=student_temp
-    )
-
-    # --- SigLIP2 teacher distributions ---
-    sig_i2t, sig_t2i = compute_similarity_distribution(
-        siglip_image_embeds, siglip_text_embeds, temperature=kl_temperature
-    )
-
-    # --- DFN teacher distributions ---
-    dfn_i2t, dfn_t2i = compute_similarity_distribution(
-        dfn_image_embeds, dfn_text_embeds, temperature=kl_temperature
-    )
-
-    # Average the two teacher distributions
-    avg_i2t = (sig_i2t + dfn_i2t) / 2.0
-    avg_t2i = (sig_t2i + dfn_t2i) / 2.0
-
-    return kl_distillation_loss(stu_i2t, stu_t2i, avg_i2t, avg_t2i)
-
-
 # ---------------------------------------------------------------------------
-# Combined Total Loss
+# TotalLoss
 # ---------------------------------------------------------------------------
 
 class TotalLoss(nn.Module):
     """
-    Unified loss module combining L_CLIP, L_MSE, and L_KL.
+    L_total = λ1 * L_CLIP + λ2 * L_MSE(sig) + λ3 * L_KL(sig)
 
-    L_total = λ1 * L_CLIP + λ2 * L_MSE(DFN) + λ3 * L_KL(avg_teacher)
+    forward() 인자:
+      student outputs  : image_embeds, text_embeds, logit_scale
+      student proj     : img_proj_sig, txt_proj_sig  (SigLIP2 공간)
+      teacher embeds   : sig_image_embeds, sig_text_embeds  (nullable)
+      loss weights     : lambda1, lambda2, lambda3
     """
 
     def __init__(self, kl_temperature: float = 4.0):
@@ -197,61 +130,47 @@ class TotalLoss(nn.Module):
 
     def forward(
         self,
-        # Student outputs
-        image_embeds: torch.Tensor,       # (B, D) normalized
-        text_embeds: torch.Tensor,        # (B, D) normalized
-        logit_scale: torch.Tensor,        # scalar
-        # Student projections (for MSE / KD on teacher spaces)
-        img_proj_dfn: Optional[torch.Tensor] = None,   # (B, D_dfn)
-        txt_proj_dfn: Optional[torch.Tensor] = None,   # (B, D_dfn)
-        # Teacher embeddings
-        siglip_image_embeds: Optional[torch.Tensor] = None,
-        siglip_text_embeds: Optional[torch.Tensor] = None,
-        dfn_image_embeds: Optional[torch.Tensor] = None,
-        dfn_text_embeds: Optional[torch.Tensor] = None,
-        # Loss weights
-        lambda1: float = 0.3,    # L_CLIP
-        lambda2: float = 0.4,    # L_MSE
-        lambda3: float = 0.3,    # L_KL
+        # ── student outputs ──────────────────────────────────────────
+        image_embeds: torch.Tensor,          # (B, D) normalized
+        text_embeds: torch.Tensor,           # (B, D) normalized
+        logit_scale: torch.Tensor,           # scalar
+        # ── student projections (SigLIP2 공간) ──────────────────────
+        img_proj_sig: Optional[torch.Tensor] = None,   # (B, D_sig)
+        txt_proj_sig: Optional[torch.Tensor] = None,   # (B, D_sig)
+        # ── SigLIP2 teacher embeddings ───────────────────────────────
+        sig_image_embeds: Optional[torch.Tensor] = None,  # (B, D_sig) normalized
+        sig_text_embeds: Optional[torch.Tensor] = None,   # (B, D_sig) normalized
+        # ── loss weights ─────────────────────────────────────────────
+        lambda1: float = 0.3,   # L_CLIP
+        lambda2: float = 0.4,   # L_MSE
+        lambda3: float = 0.3,   # L_KL
     ) -> dict:
-        """
-        Returns a dict with individual loss components and total loss.
-        """
         losses = {}
 
-        # L_CLIP: always computed
-        l_clip = clip_contrastive_loss(image_embeds, text_embeds, logit_scale)
-        losses["l_clip"] = l_clip
+        # L_CLIP — 항상 계산
+        losses["l_clip"] = clip_contrastive_loss(image_embeds, text_embeds, logit_scale)
 
-        # L_MSE: DFN feature mimicking
-        l_mse = torch.tensor(0.0, device=image_embeds.device)
-        if lambda2 > 0 and img_proj_dfn is not None and dfn_image_embeds is not None:
-            l_mse_img = feature_mimicking_loss(img_proj_dfn, dfn_image_embeds)
-            l_mse_txt = feature_mimicking_loss(txt_proj_dfn, dfn_text_embeds)
-            l_mse = (l_mse_img + l_mse_txt) / 2.0
+        # L_MSE — teacher가 있고 lambda2 > 0 일 때
+        l_mse = torch.zeros(1, device=image_embeds.device)
+        if lambda2 > 0 and img_proj_sig is not None and sig_image_embeds is not None:
+            l_mse = (
+                feature_mimicking_loss(img_proj_sig, sig_image_embeds) +
+                feature_mimicking_loss(txt_proj_sig, sig_text_embeds)
+            ) / 2.0
         losses["l_mse"] = l_mse
 
-        # L_KL: dual teacher distribution distillation
-        l_kl = torch.tensor(0.0, device=image_embeds.device)
-        if (
-            lambda3 > 0
-            and siglip_image_embeds is not None
-            and dfn_image_embeds is not None
-        ):
-            l_kl = dual_teacher_kl_loss(
+        # L_KL — teacher가 있고 lambda3 > 0 일 때
+        l_kl = torch.zeros(1, device=image_embeds.device)
+        if lambda3 > 0 and sig_image_embeds is not None:
+            l_kl = kl_distillation_loss(
                 student_image_embeds=image_embeds,
                 student_text_embeds=text_embeds,
-                siglip_image_embeds=siglip_image_embeds,
-                siglip_text_embeds=siglip_text_embeds,
-                dfn_image_embeds=dfn_image_embeds,
-                dfn_text_embeds=dfn_text_embeds,
+                teacher_image_embeds=sig_image_embeds,
+                teacher_text_embeds=sig_text_embeds,
                 logit_scale=logit_scale,
                 kl_temperature=self.kl_temperature,
             )
         losses["l_kl"] = l_kl
 
-        # Total
-        total = lambda1 * l_clip + lambda2 * l_mse + lambda3 * l_kl
-        losses["total"] = total
-
+        losses["total"] = lambda1 * losses["l_clip"] + lambda2 * l_mse + lambda3 * l_kl
         return losses
