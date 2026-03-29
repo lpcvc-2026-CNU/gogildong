@@ -17,12 +17,12 @@ import random
 import numpy as np
 import torch
 
-from utils.config import load_config, save_config
-from models.student import build_student_model
-from models.teacher import TeacherManager
-from data.dataset import StudentTokenizer, build_dataloader
-from training.trainer import Stage1Trainer, Stage2Trainer, Stage3Trainer
-from utils.metrics import evaluate_model
+from config import load_config, save_config
+from student import build_student_model
+from teacher import TeacherManager
+from dataset import StudentTokenizer, build_dataloader
+from trainer import Stage1Trainer, Stage2Trainer, Stage3Trainer
+from metrics import evaluate_model
 
 logging.basicConfig(
     level=logging.INFO,

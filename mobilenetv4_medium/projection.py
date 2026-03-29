@@ -8,7 +8,7 @@ StudentCLIP 의 shared embedding → SigLIP2 공간으로 투영합니다.
 import torch
 import torch.nn as nn
 
-from utils.config import ConfigNode
+from config import ConfigNode
 
 
 class SigLIPProjectionHead(nn.Module):

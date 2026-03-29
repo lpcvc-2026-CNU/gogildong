@@ -1,0 +1,92 @@
+data:
+  augmentation:
+    color_jitter_brightness: 0.1
+    color_jitter_contrast: 0.1
+    color_jitter_hue: 0.05
+    color_jitter_saturation: 0.1
+    random_crop_scale_max: 1.0
+    random_crop_scale_min: 0.8
+  image_mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  image_std:
+  - 0.229
+  - 0.224
+  - 0.225
+  teacher_image_size: 384
+  teacher_mean:
+  - 0.5
+  - 0.5
+  - 0.5
+  teacher_std:
+  - 0.5
+  - 0.5
+  - 0.5
+  train_path: data/coco
+  train_subset_ratio: 0.3
+  val_path: data/coco
+export:
+  image_model_name: LPCVC26_T1_ImageEncoder
+  onnx_opset: 17
+  output_dir: export
+  qai_hub:
+    calibration_samples: 512
+    compile_options: ''
+    device: Qualcomm XR2 Gen 2
+    quantize_activations: int8
+    quantize_weights: int8
+    target_runtime: onnx
+  text_model_name: LPCVC26_T1_TextEncoder
+model:
+  clip_tokenizer_name: openai/clip-vit-base-patch32
+  clip_vocab_size: 49408
+  embed_dim: 512
+  max_text_length: 77
+  proj_sig_hidden_dim: 1024
+  siglip2_input_size: 384
+  siglip2_model_name: google/siglip2-so400m-patch14-384
+  siglip_teacher_dim: 1152
+  student_image_backbone: mobilenetv4_conv_medium.e500_r224_in1k
+  student_image_input_size: 224
+  student_text_backbone: distilbert-base-uncased
+training:
+  batch_size: 256
+  kl_temperature: 4.0
+  log_dir: logs
+  max_grad_norm: 1.0
+  num_workers: 8
+  output_dir: checkpoints
+  seed: 42
+  stage1:
+    epochs: 10
+    freeze_text: true
+    lambda1: 0.1
+    lambda2: 0.9
+    lambda3: 0.0
+    lr: 0.0001
+    warmup_steps: 500
+    weight_decay: 0.0001
+  stage2:
+    epochs: 30
+    freeze_text: false
+    lambda1: 0.3
+    lambda2_end: 0.1
+    lambda2_start: 0.5
+    lambda3_end: 0.6
+    lambda3_start: 0.2
+    lr: 5.0e-05
+    warmup_steps: 1000
+    weight_decay: 0.0001
+  stage3:
+    epochs: 5
+    freeze_text: false
+    lambda1: 0.7
+    lambda2: 0.1
+    lambda3: 0.2
+    lr: 1.0e-05
+    qat_image_encoder: true
+    qat_text_encoder: false
+    warmup_steps: 200
+    weight_decay: 0.0001
+  temperature: 0.07

@@ -13,12 +13,12 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
-from models.student import StudentCLIP
-from models.teacher import TeacherManager
-from training.loss import TotalLoss
-from utils.config import ConfigNode
+from student import StudentCLIP
+from teacher import TeacherManager
+from loss import TotalLoss
+from config import ConfigNode
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,8 @@ def train_one_step(
     lambda3: float,
     max_grad_norm: float,
     device: str,
+    amp_device_type: str,
+    amp_enabled: bool,
 ) -> dict:
     """
     배치 키:
@@ -108,7 +110,7 @@ def train_one_step(
 
     optimizer.zero_grad()
 
-    with autocast():
+    with autocast(device_type=amp_device_type, enabled=amp_enabled):
         # ── 학생 forward ────────────────────────────────────────────
         image_embeds, text_embeds, logit_scale, img_proj_sig, txt_proj_sig = model(
             student_images, student_ids, student_mask, return_projections=True
@@ -158,7 +160,10 @@ class StageTrainer:
         self.output_dir      = Path(cfg.training.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.loss_fn = TotalLoss(kl_temperature=cfg.training.kl_temperature)
-        self.scaler  = GradScaler()
+        is_cuda_device = str(device).startswith("cuda") and torch.cuda.is_available()
+        self.amp_device_type = "cuda" if is_cuda_device else "cpu"
+        self.amp_enabled = is_cuda_device
+        self.scaler  = GradScaler(self.amp_device_type, enabled=self.amp_enabled)
 
     def save_checkpoint(self, stage: int, epoch: int):
         path = self.output_dir / f"stage{stage}_epoch{epoch:03d}.pt"
@@ -181,6 +186,7 @@ class StageTrainer:
                 optimizer, self.scaler, scheduler,
                 l1, l2, l3,
                 self.cfg.training.max_grad_norm, self.device,
+                self.amp_device_type, self.amp_enabled,
             )
             for k in totals:
                 totals[k] += step.get(k, 0.0)

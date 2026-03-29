@@ -17,8 +17,8 @@ import torch.nn.functional as F
 import timm
 from transformers import DistilBertModel, DistilBertConfig
 
-from models.projection import SigLIPProjectionHead
-from utils.config import ConfigNode
+from projection import SigLIPProjectionHead
+from config import ConfigNode
 
 
 # ---------------------------------------------------------------------------
@@ -35,17 +35,38 @@ class ImageEncoder(nn.Module):
 
     def __init__(self, cfg: ConfigNode, pretrained: bool = True):
         super().__init__()
+        input_size = cfg.model.student_image_input_size
         self.backbone = timm.create_model(
             cfg.model.student_image_backbone,
             pretrained=pretrained,
             num_classes=0,
             global_pool="avg",
         )
-        self.proj = nn.Linear(self.backbone.num_features, cfg.model.embed_dim, bias=False)
+        backbone_out_dim = self._infer_backbone_out_dim(input_size)
+        self.proj = nn.Linear(backbone_out_dim, cfg.model.embed_dim, bias=False)
         self.norm = nn.LayerNorm(cfg.model.embed_dim)
 
+    def _infer_backbone_out_dim(self, input_size: int) -> int:
+        was_training = self.backbone.training
+        self.backbone.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, input_size, input_size)
+            feats = self.backbone(dummy)
+            if isinstance(feats, (tuple, list)):
+                feats = feats[0]
+            if feats.ndim > 2:
+                feats = torch.flatten(feats, start_dim=1)
+        if was_training:
+            self.backbone.train()
+        return int(feats.shape[-1])
+
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.proj(self.backbone(pixel_values)))
+        feats = self.backbone(pixel_values)
+        if isinstance(feats, (tuple, list)):
+            feats = feats[0]
+        if feats.ndim > 2:
+            feats = torch.flatten(feats, start_dim=1)
+        return self.norm(self.proj(feats))
 
 
 # ---------------------------------------------------------------------------

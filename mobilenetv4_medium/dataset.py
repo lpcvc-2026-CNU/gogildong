@@ -1,26 +1,32 @@
 """
-Dataset and DataLoader utilities for LPCVC 2026 Track 1 (Single Teacher: SigLIP2).
+Dataset and DataLoader utilities.
 
-토크나이저 정책:
-  - 학생 텍스트 인코더 → CLIPTokenizer (vocab=49408, max_len=77)
-  - SigLIP2 스승 텍스트 → AutoProcessor (teacher.py 내부 처리)
+Supported dataset layouts:
+1) CSV/TSV captions in a directory
+   - captions.csv or captions.tsv
+   - columns: image_path (or filepath), caption (or text)
 
-Dataset 은 student 토큰(student_input_ids, student_attention_mask)과
-raw caption 문자열("caption") 을 함께 배치에 포함시킵니다.
+2) COCO captions layout
+   - annotations/captions_train2017.json
+   - annotations/captions_val2017.json
+   - train2017/*.jpg
+   - val2017/*.jpg
 """
 
-import os
 import csv
+import json
+import os
+import random
 from pathlib import Path
-from typing import Optional, Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
 import torchvision.transforms as T
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from transformers import CLIPTokenizer
 
-from utils.config import ConfigNode
+from config import ConfigNode
 
 
 # ---------------------------------------------------------------------------
@@ -28,64 +34,67 @@ from utils.config import ConfigNode
 # ---------------------------------------------------------------------------
 
 def get_student_train_transform(cfg: ConfigNode) -> T.Compose:
-    aug  = cfg.data.augmentation
+    aug = cfg.data.augmentation
     size = cfg.model.student_image_input_size
-    return T.Compose([
-        T.RandomResizedCrop(
-            size,
-            scale=(aug.random_crop_scale_min, aug.random_crop_scale_max),
-            interpolation=T.InterpolationMode.BICUBIC,
-        ),
-        T.RandomHorizontalFlip(),
-        T.ColorJitter(
-            brightness=aug.color_jitter_brightness,
-            contrast=aug.color_jitter_contrast,
-            saturation=aug.color_jitter_saturation,
-            hue=aug.color_jitter_hue,
-        ),
-        T.ToTensor(),
-        T.Normalize(mean=cfg.data.image_mean, std=cfg.data.image_std),
-    ])
+    return T.Compose(
+        [
+            T.RandomResizedCrop(
+                size,
+                scale=(aug.random_crop_scale_min, aug.random_crop_scale_max),
+                interpolation=T.InterpolationMode.BICUBIC,
+            ),
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(
+                brightness=aug.color_jitter_brightness,
+                contrast=aug.color_jitter_contrast,
+                saturation=aug.color_jitter_saturation,
+                hue=aug.color_jitter_hue,
+            ),
+            T.ToTensor(),
+            T.Normalize(mean=cfg.data.image_mean, std=cfg.data.image_std),
+        ]
+    )
 
 
 def get_student_eval_transform(cfg: ConfigNode) -> T.Compose:
     size = cfg.model.student_image_input_size
-    return T.Compose([
-        T.Resize(size, interpolation=T.InterpolationMode.BICUBIC),
-        T.CenterCrop(size),
-        T.ToTensor(),
-        T.Normalize(mean=cfg.data.image_mean, std=cfg.data.image_std),
-    ])
+    return T.Compose(
+        [
+            T.Resize(size, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(size),
+            T.ToTensor(),
+            T.Normalize(mean=cfg.data.image_mean, std=cfg.data.image_std),
+        ]
+    )
 
 
 def get_siglip_teacher_transform(cfg: ConfigNode) -> T.Compose:
-    """SigLIP2 스승용 transform."""
+    """Transform for SigLIP2 teacher image input."""
     size = cfg.data.teacher_image_size
-    aug  = cfg.data.augmentation
-    return T.Compose([
-        T.RandomResizedCrop(
-            size,
-            scale=(aug.random_crop_scale_min, aug.random_crop_scale_max),
-            interpolation=T.InterpolationMode.BICUBIC,
-        ),
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize(mean=cfg.data.teacher_mean, std=cfg.data.teacher_std),
-    ])
+    aug = cfg.data.augmentation
+    return T.Compose(
+        [
+            T.RandomResizedCrop(
+                size,
+                scale=(aug.random_crop_scale_min, aug.random_crop_scale_max),
+                interpolation=T.InterpolationMode.BICUBIC,
+            ),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize(mean=cfg.data.teacher_mean, std=cfg.data.teacher_std),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
-# Tokenizer (학생 전용)
+# Tokenizer
 # ---------------------------------------------------------------------------
 
 class StudentTokenizer:
-    """
-    학생 모델용 토크나이저 (대회 규격: openai/clip-vit-base-patch32, max_len=77).
-    스승 모델에는 절대 재사용하지 마세요.
-    """
+    """Tokenizer for student text input (CLIP tokenizer, fixed max length)."""
 
     def __init__(self, cfg: ConfigNode):
-        self.tokenizer  = CLIPTokenizer.from_pretrained(cfg.model.clip_tokenizer_name)
+        self.tokenizer = CLIPTokenizer.from_pretrained(cfg.model.clip_tokenizer_name)
         self.max_length = cfg.model.max_text_length
 
     def __call__(self, texts: List[str]) -> dict:
@@ -97,7 +106,7 @@ class StudentTokenizer:
             return_tensors="pt",
         )
         return {
-            "input_ids":      encoded["input_ids"],
+            "input_ids": encoded["input_ids"],
             "attention_mask": encoded["attention_mask"],
         }
 
@@ -107,19 +116,7 @@ class StudentTokenizer:
 # ---------------------------------------------------------------------------
 
 class ImageCaptionDataset(Dataset):
-    """
-    이미지-캡션 쌍 데이터셋.
-
-    data_path 에 captions.csv 또는 captions.tsv 가 있어야 합니다.
-    형식: image_path,caption
-
-    반환 dict:
-      - student_image:           (3, 224, 224)
-      - student_input_ids:       (77,)  — CLIP token IDs
-      - student_attention_mask:  (77,)
-      - caption:                 str    — raw 문자열 (SigLIP2 스승용)
-      - teacher_image_sig:       (3, H, H)  [선택] SigLIP2 스승 입력
-    """
+    """Image-caption dataset supporting both CSV/TSV and COCO captions JSON."""
 
     def __init__(
         self,
@@ -128,16 +125,61 @@ class ImageCaptionDataset(Dataset):
         student_transform: Callable,
         teacher_transform_sig: Optional[Callable] = None,
         max_samples: Optional[int] = None,
+        split: str = "train",
+        sample_ratio: float = 1.0,
+        sample_seed: int = 42,
     ):
-        self.data_path             = Path(data_path)
-        self.tokenizer             = tokenizer
-        self.student_transform     = student_transform
+        self.data_path = Path(data_path)
+        self.tokenizer = tokenizer
+        self.student_transform = student_transform
         self.teacher_transform_sig = teacher_transform_sig
+        self.split = split
 
-        self.samples = self._load_samples(max_samples)
-        print(f"[Dataset] {len(self.samples)} 샘플 로드 완료: '{data_path}'")
+        self.samples = self._load_samples(
+            max_samples=max_samples,
+            sample_ratio=sample_ratio,
+            sample_seed=sample_seed,
+        )
+        print(
+            f"[Dataset] split={self.split}, samples={len(self.samples)} loaded from '{self.data_path}'"
+        )
 
-    def _load_samples(self, max_samples: Optional[int]) -> List[Tuple[str, str]]:
+    def _load_samples(
+        self,
+        max_samples: Optional[int],
+        sample_ratio: float,
+        sample_seed: int,
+    ) -> List[Tuple[str, str]]:
+        samples = self._load_samples_from_csv_or_tsv()
+        if not samples:
+            samples = self._load_samples_from_coco()
+
+        if not samples:
+            raise FileNotFoundError(
+                "No valid caption dataset found. Expected one of:\n"
+                f"- {self.data_path / 'captions.csv'}\n"
+                f"- {self.data_path / 'captions.tsv'}\n"
+                f"- {self.data_path / 'annotations' / 'captions_train2017.json'} (for train)\n"
+                f"- {self.data_path / 'annotations' / 'captions_val2017.json'} (for val)"
+            )
+
+        if max_samples is not None:
+            return samples[:max_samples]
+
+        if self.split == "train":
+            if sample_ratio <= 0.0 or sample_ratio > 1.0:
+                raise ValueError(
+                    f"train subset ratio must be in (0, 1], got {sample_ratio}"
+                )
+            if sample_ratio < 1.0:
+                subset_count = max(1, int(len(samples) * sample_ratio))
+                rng = random.Random(sample_seed)
+                rng.shuffle(samples)
+                samples = samples[:subset_count]
+
+        return samples
+
+    def _load_samples_from_csv_or_tsv(self) -> List[Tuple[str, str]]:
         csv_path = self.data_path / "captions.csv"
         tsv_path = self.data_path / "captions.tsv"
 
@@ -146,22 +188,56 @@ class ImageCaptionDataset(Dataset):
         elif tsv_path.exists():
             delimiter, target = "\t", tsv_path
         else:
-            raise FileNotFoundError(
-                f"captions.csv 또는 captions.tsv 없음: {self.data_path}"
-            )
+            return []
 
-        samples = []
+        samples: List[Tuple[str, str]] = []
         with open(target, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f, delimiter=delimiter):
                 img_path = row.get("image_path") or row.get("filepath", "")
-                caption  = row.get("caption")   or row.get("text", "")
+                caption = row.get("caption") or row.get("text", "")
                 if not img_path or not caption:
                     continue
                 if not os.path.isabs(img_path):
                     img_path = str(self.data_path / img_path)
-                samples.append((img_path, caption))
+                samples.append((img_path, caption.strip()))
+        return samples
 
-        return samples[:max_samples] if max_samples else samples
+    def _load_samples_from_coco(self) -> List[Tuple[str, str]]:
+        split_name = "train2017" if self.split == "train" else "val2017"
+        ann_name = (
+            "captions_train2017.json"
+            if self.split == "train"
+            else "captions_val2017.json"
+        )
+
+        ann_path = self.data_path / "annotations" / ann_name
+        image_dir = self.data_path / split_name
+
+        if not ann_path.exists() or not image_dir.exists():
+            return []
+
+        with open(ann_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        image_id_to_name = {
+            int(img["id"]): img["file_name"]
+            for img in payload.get("images", [])
+            if "id" in img and "file_name" in img
+        }
+
+        samples: List[Tuple[str, str]] = []
+        for ann in payload.get("annotations", []):
+            image_id = ann.get("image_id")
+            caption = (ann.get("caption") or "").strip()
+            file_name = image_id_to_name.get(int(image_id)) if image_id is not None else None
+
+            if not file_name or not caption:
+                continue
+
+            img_path = image_dir / file_name
+            samples.append((str(img_path), caption))
+
+        return samples
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -175,25 +251,21 @@ class ImageCaptionDataset(Dataset):
 
         result = {
             "student_image": self.student_transform(image),
-            "caption":       caption,
+            "caption": caption,
         }
         if self.teacher_transform_sig is not None:
             result["teacher_image_sig"] = self.teacher_transform_sig(image)
         return result
 
     def collate_fn(self, batch: List[dict]) -> dict:
-        """
-        배치 collation: 학생 텍스트는 StudentTokenizer 로 처리.
-        caption raw text 도 유지 (SigLIP2 스승 re-tokenization 용).
-        """
-        captions  = [item["caption"] for item in batch]
+        captions = [item["caption"] for item in batch]
         tokenized = self.tokenizer(captions)
 
         result = {
-            "student_image":          torch.stack([item["student_image"] for item in batch]),
-            "student_input_ids":      tokenized["input_ids"],
+            "student_image": torch.stack([item["student_image"] for item in batch]),
+            "student_input_ids": tokenized["input_ids"],
             "student_attention_mask": tokenized["attention_mask"],
-            "caption":                captions,
+            "caption": captions,
         }
         if "teacher_image_sig" in batch[0]:
             result["teacher_image_sig"] = torch.stack(
@@ -203,7 +275,7 @@ class ImageCaptionDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# DataLoader 팩토리
+# DataLoader factory
 # ---------------------------------------------------------------------------
 
 def build_dataloader(
@@ -215,10 +287,12 @@ def build_dataloader(
     max_samples: Optional[int] = None,
 ) -> DataLoader:
     student_transform = (
-        get_student_train_transform(cfg) if is_train
-        else get_student_eval_transform(cfg)
+        get_student_train_transform(cfg) if is_train else get_student_eval_transform(cfg)
     )
     teacher_sig = get_siglip_teacher_transform(cfg) if use_teacher_transforms else None
+
+    split = "train" if is_train else "val"
+    train_subset_ratio = cfg.data.get("train_subset_ratio", 1.0)
 
     dataset = ImageCaptionDataset(
         data_path=data_path,
@@ -226,6 +300,9 @@ def build_dataloader(
         student_transform=student_transform,
         teacher_transform_sig=teacher_sig,
         max_samples=max_samples,
+        split=split,
+        sample_ratio=train_subset_ratio,
+        sample_seed=cfg.training.seed,
     )
 
     return DataLoader(

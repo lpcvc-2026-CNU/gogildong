@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List
 
-from utils.config import ConfigNode
+from config import ConfigNode
 
 
 class SigLIP2Teacher(nn.Module):

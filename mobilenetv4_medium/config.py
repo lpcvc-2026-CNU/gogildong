@@ -1,26 +1,17 @@
 """
-YAML 기반 설정 로더.
-config.yaml 을 읽어 중첩된 dict 를 속성 접근(dot notation) 가능한 객체로 반환합니다.
-
-사용 예:
-    from utils.config import load_config
-    cfg = load_config("config.yaml")
-    print(cfg.model.embed_dim)       # 512
-    print(cfg.training.stage1.lr)    # 1e-4
+YAML-based configuration utilities.
 """
 
 from __future__ import annotations
 
-import yaml
 from pathlib import Path
 from typing import Any, Union
 
+import yaml
+
 
 class ConfigNode:
-    """
-    중첩 dict 를 속성 접근으로 읽을 수 있게 감싸는 클래스.
-    cfg["key"] 와 cfg.key 모두 지원합니다.
-    """
+    """Dictionary wrapper that supports attribute access."""
 
     def __init__(self, data: dict):
         for key, value in data.items():
@@ -39,7 +30,6 @@ class ConfigNode:
         return getattr(self, key, default)
 
     def to_dict(self) -> dict:
-        """ConfigNode → dict 로 재변환."""
         result = {}
         for key, value in self.__dict__.items():
             if isinstance(value, ConfigNode):
@@ -54,35 +44,48 @@ class ConfigNode:
 
 def load_config(config_path: Union[str, Path] = "config.yaml") -> ConfigNode:
     """
-    YAML 파일을 읽어 ConfigNode 객체로 반환합니다.
+    Load YAML and return a ConfigNode.
 
-    Args:
-        config_path: config.yaml 경로 (기본값: "config.yaml")
-
-    Returns:
-        ConfigNode: 속성 접근 가능한 설정 객체
-
-    Raises:
-        FileNotFoundError: config.yaml 이 존재하지 않을 때
+    Resolution order:
+    1) provided path as-is (absolute, or relative to current working directory)
+    2) when relative and not found, relative to this module directory
     """
     path = Path(config_path)
-    if not path.exists():
+    candidates = [path]
+
+    if not path.is_absolute():
+        candidates.append(Path(__file__).resolve().parent / path)
+
+    resolved: Path | None = None
+    for candidate in candidates:
+        if candidate.exists():
+            resolved = candidate
+            break
+
+    if resolved is None:
+        searched = "\n".join(f"- {c.resolve()}" for c in candidates)
         raise FileNotFoundError(
-            f"설정 파일을 찾을 수 없습니다: {path.resolve()}\n"
-            f"프로젝트 루트에 config.yaml 이 있는지 확인하세요."
+            "설정 파일을 찾을 수 없습니다.\n"
+            f"검색한 경로:\n{searched}"
         )
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(resolved, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     if raw is None:
-        raise ValueError(f"config.yaml 이 비어 있습니다: {path}")
+        raise ValueError(f"config.yaml 파일이 비어 있습니다: {resolved}")
 
-    return ConfigNode(raw)
+    cfg = ConfigNode(raw)
+
+    # Backward-compatible default: if not set, use full train set.
+    if hasattr(cfg, "data") and not hasattr(cfg.data, "train_subset_ratio"):
+        setattr(cfg.data, "train_subset_ratio", 1.0)
+
+    return cfg
 
 
 def save_config(cfg: ConfigNode, output_path: Union[str, Path]) -> None:
-    """ConfigNode 를 YAML 파일로 저장합니다 (학습 재현용)."""
+    """Save ConfigNode to YAML."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:

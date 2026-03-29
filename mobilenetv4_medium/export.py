@@ -17,8 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.student import StudentCLIP
-from utils.config import ModelConfig, ExportConfig
+from student import StudentCLIP
+from config import ModelConfig, ExportConfig
 
 logger = logging.getLogger(__name__)
 

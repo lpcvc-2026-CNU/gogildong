@@ -39,8 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 
-from utils.config import load_config, ConfigNode
-from models.student import StudentCLIP, build_student_model
+from config import load_config, ConfigNode
+from student import StudentCLIP, build_student_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)

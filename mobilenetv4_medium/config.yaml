@@ -1,23 +1,20 @@
 # =============================================================================
-# LPCVC 2026 Track 1 — Central Configuration (Single Teacher: SigLIP2)
+# LPCVC 2026 Track 1 - Central Configuration (Single Teacher: SigLIP2)
 # =============================================================================
 
 model:
   student_image_backbone: "mobilenetv4_conv_medium.e500_r224_in1k"
-  student_image_input_size: 224          # 대회 고정 규격 — 절대 변경 금지
+  student_image_input_size: 224
 
   student_text_backbone: "distilbert-base-uncased"
 
-  # ─── 토크나이저 (대회 규격 고정) ─────────────────────────────────────────
   clip_tokenizer_name: "openai/clip-vit-base-patch32"
   max_text_length: 77
   clip_vocab_size: 49408
 
-  # 공유 임베딩 차원
   embed_dim: 512
 
-  # SigLIP2 단일 스승 설정
-  siglip_teacher_dim: 1152             # SigLIP2-SO400M 임베딩 차원
+  siglip_teacher_dim: 1152
   proj_sig_hidden_dim: 1024
 
   siglip2_model_name: "google/siglip2-so400m-patch14-384"
@@ -35,39 +32,28 @@ training:
   kl_temperature: 4.0
   max_grad_norm: 1.0
 
-  # -------------------------------------------------------------------
-  # Stage 1: SigLIP2 Warm-up — 이미지 인코더 초기화
-  # 텍스트 동결, L_MSE(SigLIP2) 위주
-  # -------------------------------------------------------------------
   stage1:
     epochs: 10
     lr: 1.0e-4
     weight_decay: 1.0e-4
     warmup_steps: 500
     freeze_text: true
-    lambda1: 0.1          # L_CLIP (보조)
-    lambda2: 0.9          # L_MSE(SigLIP2)
-    lambda3: 0.0          # L_KL (비활성)
+    lambda1: 0.1
+    lambda2: 0.9
+    lambda3: 0.0
 
-  # -------------------------------------------------------------------
-  # Stage 2: SigLIP2 KD 메인 학습
-  # 텍스트 해제, 동적 λ: λ2↓, λ3↑
-  # -------------------------------------------------------------------
   stage2:
     epochs: 30
     lr: 5.0e-5
     weight_decay: 1.0e-4
     warmup_steps: 1000
     freeze_text: false
-    lambda1: 0.3              # L_CLIP (고정)
-    lambda2_start: 0.5        # 초반: MSE 높게
-    lambda2_end: 0.1          # 후반: MSE 낮게
-    lambda3_start: 0.2        # 초반: KL 낮게
-    lambda3_end: 0.6          # 후반: KL 높게
+    lambda1: 0.3
+    lambda2_start: 0.5
+    lambda2_end: 0.1
+    lambda3_start: 0.2
+    lambda3_end: 0.6
 
-  # -------------------------------------------------------------------
-  # Stage 3: QAT Fine-tuning
-  # -------------------------------------------------------------------
   stage3:
     epochs: 5
     lr: 1.0e-5
@@ -82,12 +68,13 @@ training:
 
 # -----------------------------------------------------------------------------
 data:
-  train_path: "data/train"
-  val_path: "data/val"
-  teacher_image_size: 384              # SigLIP2 입력 해상도
-  image_mean: [0.485, 0.456, 0.406]   # 학생 (ImageNet)
+  train_path: "data/coco"
+  val_path: "data/coco"
+  train_subset_ratio: 0.3
+  teacher_image_size: 384
+  image_mean: [0.485, 0.456, 0.406]
   image_std:  [0.229, 0.224, 0.225]
-  teacher_mean: [0.5, 0.5, 0.5]       # SigLIP2
+  teacher_mean: [0.5, 0.5, 0.5]
   teacher_std:  [0.5, 0.5, 0.5]
   augmentation:
     random_crop_scale_min: 0.8

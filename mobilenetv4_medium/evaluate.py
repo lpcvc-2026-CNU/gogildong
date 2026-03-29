@@ -9,10 +9,10 @@ import argparse
 import logging
 import torch
 
-from utils.config import load_config        # ← get_default_config() 제거
-from models.student import build_student_model
-from data.dataset import StudentTokenizer, build_dataloader
-from utils.metrics import evaluate_model
+from config import load_config        # ← get_default_config() 제거
+from student import build_student_model
+from dataset import StudentTokenizer, build_dataloader
+from metrics import evaluate_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
