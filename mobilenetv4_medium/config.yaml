@@ -6,7 +6,7 @@ model:
   student_image_backbone: "mobilenetv4_conv_medium.e500_r224_in1k"
   student_image_input_size: 224
 
-  student_text_backbone: "distilbert-base-uncased"
+  student_text_backbone: "clip-ViT-B-32"
 
   clip_tokenizer_name: "openai/clip-vit-base-patch32"
   max_text_length: 77
