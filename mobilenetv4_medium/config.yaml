@@ -1,22 +1,30 @@
 # =============================================================================
 # LPCVC 2026 Track 1 - Central Configuration (Single Teacher: SigLIP2)
+# Text Encoder: CLIP ViT-B/32 (CLIPTextModel, openai/clip-vit-base-patch32)
 # =============================================================================
 
 model:
   student_image_backbone: "mobilenetv4_conv_medium.e500_r224_in1k"
   student_image_input_size: 224
 
-  student_text_backbone: "clip-ViT-B-32"
+  # 텍스트 인코더: CLIP ViT-B/32 text encoder
+  # CLIPTokenizer 와 CLIPTextModel 이 동일 vocab(49408)을 공유하므로
+  # DistilBERT 사용 시 필요했던 word_embeddings 교체가 불필요합니다.
+  student_text_backbone: "openai/clip-vit-base-patch32"
 
+  # 토크나이저 (대회 평가 규격 고정 — 변경 금지)
   clip_tokenizer_name: "openai/clip-vit-base-patch32"
   max_text_length: 77
-  clip_vocab_size: 49408
 
+  # 공유 임베딩 차원
+  # CLIP ViT-B/32 hidden_size = 512 이므로 embed_dim 과 일치 → 별도 projection 없음
   embed_dim: 512
 
+  # SigLIP2 스승 투영 헤드
   siglip_teacher_dim: 1152
   proj_sig_hidden_dim: 1024
 
+  # 스승 모델 (학습 시에만 사용)
   siglip2_model_name: "google/siglip2-so400m-patch14-384"
   siglip2_input_size: 384
 
@@ -37,7 +45,7 @@ training:
     lr: 1.0e-4
     weight_decay: 1.0e-4
     warmup_steps: 500
-    freeze_text: true
+    freeze_text: true      # CLIP 텍스트 인코더 동결
     lambda1: 0.1
     lambda2: 0.9
     lambda3: 0.0
@@ -47,7 +55,7 @@ training:
     lr: 5.0e-5
     weight_decay: 1.0e-4
     warmup_steps: 1000
-    freeze_text: false
+    freeze_text: false     # CLIP 텍스트 인코더 해제
     lambda1: 0.3
     lambda2_start: 0.5
     lambda2_end: 0.1
@@ -64,7 +72,7 @@ training:
     lambda2: 0.1
     lambda3: 0.2
     qat_image_encoder: true
-    qat_text_encoder: false
+    qat_text_encoder: false   # CLIP 텍스트 인코더 QAT는 기본 비활성
 
 # -----------------------------------------------------------------------------
 data:

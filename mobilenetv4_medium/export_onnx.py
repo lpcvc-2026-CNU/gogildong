@@ -1,8 +1,9 @@
 """
 LPCVC 2026 Track 1 — ONNX 내보내기 및 Qualcomm AI Hub 제출 스크립트.
 
-26LPCVC_Track1_Sample_Solution (lpcvai/26LPCVC_Track1_Sample_Solution) 의
-공식 제출 방식을 기반으로 작성되었습니다.
+텍스트 인코더: CLIP ViT-B/32 (CLIPTextModel)
+  - 입력: input_ids (1, 77) int32, attention_mask (1, 77) int32
+  - 출력: text_embeddings (1, embed_dim) float32
 
 전체 워크플로우:
   1. 학습된 PyTorch 모델 로드
@@ -10,7 +11,7 @@ LPCVC 2026 Track 1 — ONNX 내보내기 및 Qualcomm AI Hub 제출 스크립트
   3. qai_hub.submit_compile_job() 으로 각 모델 컴파일 (Qualcomm XR2 Gen 2)
   4. 컴파일 완료 대기 및 결과 확인
   5. (선택) 양자화: qai_hub.submit_quantize_job()
-  6. (선택) 프로파일링: qai_hub.submit_profile_job() 으로 지연시간 측정
+  6. (선택) 프로파일링: qai_hub.submit_profile_job()
 
 Usage:
     # ONNX 내보내기만
@@ -21,9 +22,6 @@ Usage:
 
     # ONNX + 컴파일 + 양자화(INT8) + 프로파일링
     python scripts/export_onnx.py --checkpoint checkpoints/stage3_epoch005.pt --quantize --profile
-
-    # 커스텀 설정 파일
-    python scripts/export_onnx.py --checkpoint ... --config config.yaml
 """
 
 import argparse
@@ -47,14 +45,14 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ONNX 래퍼 모듈 (추론 전용, projection head 없음)
+# ONNX 래퍼 모듈 (추론 전용)
 # ---------------------------------------------------------------------------
 
 class ImageEncoderONNX(nn.Module):
     """
     ONNX 내보내기 전용 이미지 인코더 래퍼.
-    입력  : pixel_values (1, 3, 224, 224)
-    출력  : image_embeddings (1, embed_dim) — L2-normalized
+    입력 : pixel_values (1, 3, 224, 224) float32
+    출력 : image_embeddings (1, embed_dim) float32 — L2-normalized
     """
 
     def __init__(self, model: StudentCLIP):
@@ -68,16 +66,23 @@ class ImageEncoderONNX(nn.Module):
 
 class TextEncoderONNX(nn.Module):
     """
-    ONNX 내보내기 전용 텍스트 인코더 래퍼.
-    입력  : input_ids (1, 77), attention_mask (1, 77)
-    출력  : text_embeddings (1, embed_dim) — L2-normalized
+    ONNX 내보내기 전용 텍스트 인코더 래퍼 (CLIP ViT-B/32).
+    입력 : input_ids (1, 77) int32
+            attention_mask (1, 77) int32
+    출력 : text_embeddings (1, embed_dim) float32 — L2-normalized
+
+    Note: QAI Hub NPU 백엔드는 int32 를 요구합니다.
     """
 
     def __init__(self, model: StudentCLIP):
         super().__init__()
         self.text_encoder = model.text_encoder
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,        # int32
+        attention_mask: torch.Tensor,   # int32
+    ) -> torch.Tensor:
         feats = self.text_encoder(input_ids, attention_mask)
         return F.normalize(feats, dim=-1)
 
@@ -94,17 +99,17 @@ def export_to_onnx(model: StudentCLIP, cfg: ConfigNode, output_dir: Path) -> dic
         {'image': Path, 'text': Path}
     """
     model.eval()
-    opset   = cfg.export.onnx_opset
+    opset    = cfg.export.onnx_opset
     img_size = cfg.model.student_image_input_size
     seq_len  = cfg.model.max_text_length
 
     image_onnx_path = output_dir / "image_encoder.onnx"
     text_onnx_path  = output_dir / "text_encoder.onnx"
 
-    # --- 이미지 인코더 ---
+    # ── 이미지 인코더 ─────────────────────────────────────────────────────────
     logger.info(f"이미지 인코더 ONNX 내보내기 → {image_onnx_path}")
-    img_wrapper   = ImageEncoderONNX(model).cpu().eval()
-    dummy_image   = torch.randn(1, 3, img_size, img_size)
+    img_wrapper = ImageEncoderONNX(model).cpu().eval()
+    dummy_image = torch.randn(1, 3, img_size, img_size)
 
     torch.onnx.export(
         img_wrapper,
@@ -121,11 +126,13 @@ def export_to_onnx(model: StudentCLIP, cfg: ConfigNode, output_dir: Path) -> dic
         export_params=True,
     )
 
-    # --- 텍스트 인코더 ---
+    # ── 텍스트 인코더 (CLIP ViT-B/32) ────────────────────────────────────────
     logger.info(f"텍스트 인코더 ONNX 내보내기 → {text_onnx_path}")
-    txt_wrapper        = TextEncoderONNX(model).cpu().eval()
-    dummy_input_ids    = torch.zeros(1, seq_len, dtype=torch.long)
-    dummy_attn_mask    = torch.ones(1, seq_len, dtype=torch.long)
+    txt_wrapper = TextEncoderONNX(model).cpu().eval()
+
+    # QAI Hub 는 int32 를 요구하므로 dummy 입력을 int32 로 생성합니다.
+    dummy_input_ids   = torch.zeros(1, seq_len, dtype=torch.int32)
+    dummy_attn_mask   = torch.ones(1, seq_len, dtype=torch.int32)
 
     torch.onnx.export(
         txt_wrapper,
@@ -158,20 +165,23 @@ def verify_onnx(model: StudentCLIP, paths: dict, cfg: ConfigNode) -> bool:
     seq_len  = cfg.model.max_text_length
     model.eval()
 
-    dummy_image   = torch.randn(1, 3, img_size, img_size)
-    dummy_ids     = torch.zeros(1, seq_len, dtype=torch.long)
-    dummy_mask    = torch.ones(1, seq_len, dtype=torch.long)
+    dummy_image = torch.randn(1, 3, img_size, img_size)
+    dummy_ids   = torch.zeros(1, seq_len, dtype=torch.int32)
+    dummy_mask  = torch.ones(1, seq_len, dtype=torch.int32)
 
     with torch.no_grad():
+        # encode_text 내부에서 int64 로 변환될 수 있으므로 long() 으로 캐스팅
         pt_img = model.encode_image(dummy_image).numpy()
-        pt_txt = model.encode_text(dummy_ids, dummy_mask).numpy()
+        pt_txt = model.encode_text(dummy_ids.long(), dummy_mask.long()).numpy()
 
-    img_sess = ort.InferenceSession(str(paths["image"]))
-    txt_sess = ort.InferenceSession(str(paths["text"]))
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 3
+    img_sess = ort.InferenceSession(str(paths["image"]), opts)
+    txt_sess = ort.InferenceSession(str(paths["text"]), opts)
 
     ort_img = img_sess.run(None, {"pixel_values": dummy_image.numpy()})[0]
     ort_txt = txt_sess.run(None, {
-        "input_ids": dummy_ids.numpy(),
+        "input_ids":      dummy_ids.numpy(),
         "attention_mask": dummy_mask.numpy(),
     })[0]
 
@@ -188,12 +198,7 @@ def verify_onnx(model: StudentCLIP, paths: dict, cfg: ConfigNode) -> bool:
 # ---------------------------------------------------------------------------
 
 def compile_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
-    """
-    qai_hub.submit_compile_job() 으로 두 모델을 Qualcomm AI Hub 에 컴파일 제출.
-
-    Returns:
-        {'image': CompileJob, 'text': CompileJob}
-    """
+    """qai_hub.submit_compile_job() 으로 두 모델을 Qualcomm AI Hub 에 컴파일 제출."""
     try:
         import qai_hub as hub
     except ImportError:
@@ -210,7 +215,7 @@ def compile_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
     logger.info(f"[AI Hub] target_runtime: {hub_cfg.target_runtime}")
 
     # 이미지 인코더 컴파일
-    logger.info(f"[AI Hub] 이미지 인코더 컴파일 제출...")
+    logger.info("[AI Hub] 이미지 인코더 컴파일 제출...")
     img_compile_job = hub.submit_compile_job(
         model=str(paths["image"]),
         device=device,
@@ -220,8 +225,8 @@ def compile_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
     )
     logger.info(f"[AI Hub] 이미지 인코더 Job ID: {img_compile_job.job_id}")
 
-    # 텍스트 인코더 컴파일
-    logger.info(f"[AI Hub] 텍스트 인코더 컴파일 제출...")
+    # 텍스트 인코더 컴파일 — input_ids, attention_mask 모두 int32
+    logger.info("[AI Hub] 텍스트 인코더 컴파일 제출...")
     txt_compile_job = hub.submit_compile_job(
         model=str(paths["text"]),
         device=device,
@@ -238,10 +243,6 @@ def compile_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
 
 
 def wait_for_compile(jobs: dict) -> dict:
-    """
-    컴파일 완료 대기 후 상태 반환.
-    성공하면 각 job 의 target model 을 반환합니다.
-    """
     results = {}
     for name, job in jobs.items():
         logger.info(f"[AI Hub] {name} 인코더 컴파일 완료 대기 중...")
@@ -261,27 +262,20 @@ def wait_for_compile(jobs: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def quantize_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
-    """
-    qai_hub.submit_quantize_job() 으로 INT8 양자화 수행.
-    양자화 보정 데이터는 랜덤 샘플을 사용합니다.
-
-    Returns:
-        양자화된 ONNX 모델 경로 dict {'image': ..., 'text': ...}
-    """
+    """qai_hub.submit_quantize_job() 으로 INT8 양자화 수행."""
     try:
         import qai_hub as hub
     except ImportError:
         logger.error("qai_hub 미설치.")
         raise
 
-    hub_cfg = cfg.export.qai_hub
+    hub_cfg  = cfg.export.qai_hub
     img_size = cfg.model.student_image_input_size
     seq_len  = cfg.model.max_text_length
     n_calib  = hub_cfg.calibration_samples
 
     logger.info(f"[AI Hub] INT8 양자화 (보정 샘플 수: {n_calib})")
 
-    # 이미지 인코더 양자화
     img_calib = {"pixel_values": [
         np.random.randn(1, 3, img_size, img_size).astype(np.float32)
         for _ in range(n_calib)
@@ -295,10 +289,10 @@ def quantize_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
     )
     logger.info(f"[AI Hub] 이미지 인코더 양자화 Job ID: {img_q_job.job_id}")
 
-    # 텍스트 인코더 양자화
+    # 텍스트 인코더: int32 더미 데이터
     txt_calib = {
         "input_ids":      [np.zeros((1, seq_len), dtype=np.int32) for _ in range(n_calib)],
-        "attention_mask": [np.ones((1, seq_len), dtype=np.int32)  for _ in range(n_calib)],
+        "attention_mask": [np.ones((1, seq_len),  dtype=np.int32) for _ in range(n_calib)],
     }
     txt_q_job = hub.submit_quantize_job(
         model=str(paths["text"]),
@@ -309,7 +303,6 @@ def quantize_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
     )
     logger.info(f"[AI Hub] 텍스트 인코더 양자화 Job ID: {txt_q_job.job_id}")
 
-    # 완료 대기 및 다운로드
     output_dir = Path(cfg.export.output_dir)
     q_paths = {}
     for name, job, orig_path in [
@@ -330,10 +323,7 @@ def quantize_on_aihub(paths: dict, cfg: ConfigNode) -> dict:
 # ---------------------------------------------------------------------------
 
 def profile_on_aihub(compiled_models: dict, cfg: ConfigNode):
-    """
-    컴파일된 모델을 실제 디바이스에서 프로파일링하여 지연시간을 측정합니다.
-    이미지 + 텍스트 합산 35ms 미만인지 확인하세요.
-    """
+    """컴파일된 모델을 실제 디바이스에서 프로파일링합니다."""
     try:
         import qai_hub as hub
     except ImportError:
@@ -355,7 +345,6 @@ def profile_on_aihub(compiled_models: dict, cfg: ConfigNode):
         logger.info(f"[AI Hub] {name} 인코더 프로파일 Job ID: {profile_job.job_id}")
         profile_job.wait()
         profile = profile_job.download_profile()
-        # 추론 시간 (밀리초)
         inference_ms = profile.get("execution_summary", {}).get("inference_time_ms", "N/A")
         logger.info(f"[AI Hub] {name} 인코더 추론 시간: {inference_ms} ms")
 
@@ -366,11 +355,11 @@ def profile_on_aihub(compiled_models: dict, cfg: ConfigNode):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LPCVC 2026 Track 1 — ONNX Export & AI Hub 제출")
-    parser.add_argument("--checkpoint", type=str, required=True, help="학습된 체크포인트 경로")
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--config",     type=str, default="config.yaml")
-    parser.add_argument("--onnx_only",  action="store_true", help="ONNX 내보내기만 수행 (AI Hub 제출 생략)")
-    parser.add_argument("--quantize",   action="store_true", help="AI Hub INT8 양자화 수행")
-    parser.add_argument("--profile",    action="store_true", help="컴파일 후 AI Hub 프로파일링 수행")
+    parser.add_argument("--onnx_only",  action="store_true")
+    parser.add_argument("--quantize",   action="store_true")
+    parser.add_argument("--profile",    action="store_true")
     return parser.parse_args()
 
 
@@ -381,56 +370,45 @@ def main():
     output_dir = Path(cfg.export.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 모델 로드
     logger.info(f"체크포인트 로드: {args.checkpoint}")
     model = build_student_model(cfg).cpu()
     state = torch.load(args.checkpoint, map_location="cpu")
     model.load_state_dict(state["model_state_dict"])
     model.eval()
 
-    # 2. ONNX 내보내기
     onnx_paths = export_to_onnx(model, cfg, output_dir)
-
-    # 3. ONNX 검증
     verify_onnx(model, onnx_paths, cfg)
 
-    # 4. 파일 크기 출력
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("  ONNX 내보내기 완료")
-    print("="*60)
+    print("=" * 60)
     for name, path in onnx_paths.items():
         size_mb = path.stat().st_size / (1024 * 1024)
         print(f"  {name:<8} : {path}  ({size_mb:.1f} MB)")
-    print("="*60)
+    print("=" * 60)
 
     if args.onnx_only:
         print("\n--onnx_only 플래그 설정 — AI Hub 제출 생략.")
         return
 
-    # 5. (선택) INT8 양자화 먼저 수행
     compile_paths = onnx_paths
     if args.quantize:
         logger.info("INT8 양자화 수행 중...")
         compile_paths = quantize_on_aihub(onnx_paths, cfg)
 
-    # 6. AI Hub 컴파일 제출
     logger.info("Qualcomm AI Hub 컴파일 제출 중...")
-    compile_jobs = compile_on_aihub(compile_paths, cfg)
-
-    # 7. 컴파일 완료 대기
+    compile_jobs    = compile_on_aihub(compile_paths, cfg)
     compiled_models = wait_for_compile(compile_jobs)
 
-    # 8. (선택) 프로파일링
     if args.profile and compiled_models:
         profile_on_aihub(compiled_models, cfg)
 
-    # 9. 제출 정보 출력
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("  Qualcomm AI Hub 컴파일 완료")
-    print("="*60)
+    print("=" * 60)
     for name, job in compile_jobs.items():
         print(f"  {name:<8} encoder Job ID: {job.job_id}")
-    print("="*60)
+    print("=" * 60)
     print("\nLPCVC 2026 제출 절차:")
     print("  1. 위 Job ID 를 LPCVC 제출 포털에 입력하세요.")
     print("  2. Stage 1 지연시간 기준: 이미지+텍스트 합산 35ms 미만")

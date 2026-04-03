@@ -3,8 +3,10 @@ Student CLIP model for LPCVC 2026 Track 1 (Single Teacher: SigLIP2).
 
 토크나이저 정책:
   대회 평가 규격: openai/clip-vit-base-patch32 로 tokenize 한 (1×77) 정수 텐서 입력.
-  DistilBERT 기본 vocab(30522)은 이 토큰 ID를 수용하지 못함.
-  → TextEncoder 초기화 시 word_embeddings 레이어를 CLIP vocab 크기(49408)로 교체.
+  텍스트 인코더: CLIP ViT-B/32 의 text encoder (CLIPTextModel) 를 그대로 사용.
+  - 입력: input_ids (B, 77), attention_mask (B, 77)
+  - 출력: pooler_output — EOS 토큰 표현, hidden_size=512 (embed_dim 과 일치)
+  - vocab 교체 불필요: CLIP tokenizer ↔ CLIP text model 이 동일 vocabulary 공유.
 
 추론 시에는 shared L2-normalized embedding 만 사용.
 SigLIPProjectionHead 는 학습 시에만 활성화.
@@ -15,14 +17,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from transformers import DistilBertModel, DistilBertConfig
+from transformers import CLIPTextModel, CLIPTextConfig
 
 from projection import SigLIPProjectionHead
 from config import ConfigNode
 
 
 # ---------------------------------------------------------------------------
-# Image Encoder
+# Image Encoder (변경 없음)
 # ---------------------------------------------------------------------------
 
 class ImageEncoder(nn.Module):
@@ -70,17 +72,24 @@ class ImageEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Text Encoder
+# Text Encoder — CLIP ViT-B/32 text encoder
 # ---------------------------------------------------------------------------
 
 class TextEncoder(nn.Module):
     """
-    DistilBERT-Base + Linear → shared embed_dim.
+    CLIP ViT-B/32 텍스트 인코더 + (필요 시) Linear → embed_dim.
 
-    대회 규격 대응:
-      - CLIP tokenizer(vocab=49408) 출력 token ID 를 입력으로 받음.
-      - DistilBERT 의 word_embeddings 를 Embedding(49408, 768) 로 교체.
-      - 나머지 DistilBERT 가중치(Transformer layers)는 사전학습 값 유지.
+    CLIPTextModel 의 pooler_output 을 사용합니다.
+      - pooler_output: 마지막 [EOS] 토큰의 hidden state (hidden_size = 512)
+      - CLIP ViT-B/32 기준 hidden_size == embed_dim == 512 이므로
+        별도 projection 없이 LayerNorm 만 적용합니다.
+      - hidden_size ≠ embed_dim 인 경우 자동으로 Linear projection 을 추가합니다.
+
+    DistilBERT 대비 변경점:
+      - word_embeddings vocab 교체 불필요: CLIPTokenizer 와 CLIPTextModel 이
+        동일한 49408-token vocabulary 를 공유합니다.
+      - [CLS] 토큰 대신 [EOS] 토큰 기반 pooler_output 사용.
+      - attention_mask 는 그대로 입력받아 내부 self-attention 에서 활용합니다.
 
     Input : input_ids (B, 77), attention_mask (B, 77)
     Output: (B, embed_dim)  unnormalized
@@ -88,44 +97,63 @@ class TextEncoder(nn.Module):
 
     def __init__(self, cfg: ConfigNode, pretrained: bool = True):
         super().__init__()
+        model_name = cfg.model.clip_tokenizer_name  # "openai/clip-vit-base-patch32"
+
         if pretrained:
-            self.distilbert = DistilBertModel.from_pretrained(cfg.model.student_text_backbone)
+            self.clip_text = CLIPTextModel.from_pretrained(model_name)
         else:
-            self.distilbert = DistilBertModel(DistilBertConfig())
+            text_config = CLIPTextConfig()
+            self.clip_text = CLIPTextModel(text_config)
 
-        hidden_dim = self.distilbert.config.hidden_size  # 768
+        clip_hidden_dim = self.clip_text.config.hidden_size  # CLIP ViT-B/32 → 512
 
-        clip_vocab_size = cfg.model.clip_vocab_size  # 49408
-        if self.distilbert.config.vocab_size != clip_vocab_size:
-            self.distilbert.embeddings.word_embeddings = nn.Embedding(
-                clip_vocab_size, hidden_dim, padding_idx=1
+        # embed_dim 과 차이가 있는 경우에만 projection 추가
+        if clip_hidden_dim != cfg.model.embed_dim:
+            self.proj: nn.Module = nn.Linear(
+                clip_hidden_dim, cfg.model.embed_dim, bias=False
             )
-            nn.init.xavier_uniform_(self.distilbert.embeddings.word_embeddings.weight)
+            nn.init.xavier_uniform_(self.proj.weight)
+        else:
+            self.proj = nn.Identity()
 
-        self.proj = nn.Linear(hidden_dim, cfg.model.embed_dim, bias=False)
         self.norm = nn.LayerNorm(cfg.model.embed_dim)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        outputs    = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
-        cls_output = outputs.last_hidden_state[:, 0, :]
-        return self.norm(self.proj(cls_output))
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            input_ids:      (B, 77)  int64 — CLIPTokenizer 출력
+            attention_mask: (B, 77)  int64 — 패딩 마스크 (1=유효, 0=패딩)
+        Returns:
+            (B, embed_dim)  unnormalized
+        """
+        outputs = self.clip_text(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        # pooler_output: EOS 토큰의 표현 — (B, hidden_size)
+        feats = outputs.pooler_output
+        return self.norm(self.proj(feats))
 
     def freeze(self):
-        for p in self.distilbert.parameters():
+        for p in self.clip_text.parameters():
             p.requires_grad = False
 
     def unfreeze(self):
-        for p in self.distilbert.parameters():
+        for p in self.clip_text.parameters():
             p.requires_grad = True
 
 
 # ---------------------------------------------------------------------------
-# Student CLIP
+# Student CLIP (변경 없음 — TextEncoder 교체만으로 자동 반영)
 # ---------------------------------------------------------------------------
 
 class StudentCLIP(nn.Module):
     """
-    Full student model: ImageEncoder + TextEncoder + SigLIPProjectionHead.
+    Full student model: ImageEncoder + TextEncoder(CLIP ViT-B/32) + SigLIPProjectionHead.
 
     SigLIPProjectionHead: student embed → SigLIP2 공간 (MSE + KL 증류)
     추론 시에는 shared L2-normalized embed 만 사용.
@@ -133,10 +161,10 @@ class StudentCLIP(nn.Module):
 
     def __init__(self, cfg: ConfigNode):
         super().__init__()
-        self.image_encoder    = ImageEncoder(cfg)
-        self.text_encoder     = TextEncoder(cfg)
+        self.image_encoder = ImageEncoder(cfg)
+        self.text_encoder  = TextEncoder(cfg)
         # 단일 스승(SigLIP2)용 projection head — 이미지/텍스트 공유
-        self.proj_head        = SigLIPProjectionHead(cfg)
+        self.proj_head     = SigLIPProjectionHead(cfg)
 
         init_val = -math.log(cfg.training.temperature)
         self.logit_scale = nn.Parameter(torch.ones([]) * init_val)
@@ -145,7 +173,11 @@ class StudentCLIP(nn.Module):
         """L2-normalized 이미지 임베딩 (추론용)."""
         return F.normalize(self.image_encoder(pixel_values), dim=-1)
 
-    def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def encode_text(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
         """L2-normalized 텍스트 임베딩 (추론용)."""
         return F.normalize(self.text_encoder(input_ids, attention_mask), dim=-1)
 
